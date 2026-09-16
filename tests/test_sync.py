@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from xhs_ingest import sync
-from xhs_ingest.collector import CollectorSession, build_favorite_refs, feed_payload_has_note
+from xhs_ingest.collector import (
+    CollectorSession,
+    XhsPlaywrightCollector,
+    build_favorite_refs,
+    feed_payload_has_note,
+)
 from xhs_ingest.errors import (
     AuthRequiredError,
     ContentUnavailableError,
@@ -230,6 +235,24 @@ def test_session_fetch_note_requires_favorite_ref():
     session = CollectorSession.__new__(CollectorSession)  # no context needed for the type check
     with pytest.raises(TypeError, match="FavoriteRef"):
         session.fetch_note("6aa174a8000000002901b985")
+
+
+def test_spa_navigation_waits_for_domcontentloaded(tmp_path: Path):
+    class FakePage:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int]] = []
+
+        def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+            self.calls.append((url, wait_until, timeout))
+
+    collector = XhsPlaywrightCollector(profile_dir=tmp_path, timeout_ms=12_345)
+    page = FakePage()
+
+    collector._navigate_spa(page, "https://www.xiaohongshu.com/explore")
+
+    assert page.calls == [
+        ("https://www.xiaohongshu.com/explore", "domcontentloaded", 12_345)
+    ]
 
 
 # ======================================================================

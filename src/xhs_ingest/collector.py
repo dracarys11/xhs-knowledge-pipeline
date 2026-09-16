@@ -105,6 +105,10 @@ class XhsPlaywrightCollector:
         )
         return pw, context
 
+    def _navigate_spa(self, page: Page, url: str) -> None:
+        """Navigate without waiting for XHS's long-lived SPA resources to settle."""
+        page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+
     def interactive_login(self, timeout_seconds: int = 180) -> bool:
         """
         Launches a headed browser for human QR code or SMS login.
@@ -115,7 +119,7 @@ class XhsPlaywrightCollector:
         pw, context = self._launch_context(headless=False)
         try:
             page = context.new_page()
-            page.goto(f"{XHS_BASE_URL}/explore", timeout=self.timeout_ms)
+            self._navigate_spa(page, f"{XHS_BASE_URL}/explore")
             time.sleep(2)
 
             try:
@@ -200,7 +204,7 @@ class XhsPlaywrightCollector:
         pw, context = self._launch_context(headless=True)
         try:
             page = context.new_page()
-            page.goto(f"{XHS_BASE_URL}/explore", timeout=self.timeout_ms)
+            self._navigate_spa(page, f"{XHS_BASE_URL}/explore")
             time.sleep(2)
             is_auth = page.evaluate(
                 """() => {
@@ -280,7 +284,7 @@ class XhsPlaywrightCollector:
             page.on("response", handle_response)
 
             # Step 1: Navigate to explore page to locate user profile link
-            page.goto(f"{XHS_BASE_URL}/explore", timeout=self.timeout_ms)
+            self._navigate_spa(page, f"{XHS_BASE_URL}/explore")
             time.sleep(2)
             self._check_page_anomalies(page)
 
@@ -347,7 +351,7 @@ class XhsPlaywrightCollector:
             else:
                 fav_url += "?tab=fav&subTab=note"
 
-            page.goto(fav_url, timeout=self.timeout_ms)
+            self._navigate_spa(page, fav_url)
             time.sleep(3)
             self._check_page_anomalies(page)
 
@@ -507,7 +511,7 @@ class XhsPlaywrightCollector:
 
             page.on("response", handle_response)
 
-            page.goto(target_url, timeout=self.timeout_ms)
+            self._navigate_spa(page, target_url)
             time.sleep(3)
             self._check_page_anomalies(page)
 
@@ -783,7 +787,7 @@ class CollectorSession:
         page.on("response", handle_response)
 
         try:
-            page.goto(f"{XHS_BASE_URL}/explore", timeout=self._collector.timeout_ms)
+            self._collector._navigate_spa(page, f"{XHS_BASE_URL}/explore")
             time.sleep(2)
             self._collector._check_page_anomalies(page)
 
@@ -803,7 +807,7 @@ class CollectorSession:
                 )
 
             fav_url = profile_url + ("&" if "?" in profile_url else "?") + "tab=fav&subTab=note"
-            page.goto(fav_url, timeout=self._collector.timeout_ms)
+            self._collector._navigate_spa(page, fav_url)
             time.sleep(3)
             self._collector._check_page_anomalies(page)
             page.evaluate(_CLICK_FAV_TAB_JS)
@@ -904,7 +908,7 @@ class CollectorSession:
         page.on("response", handle_response)
 
         try:
-            page.goto(target_url, timeout=self._collector.timeout_ms)
+            self._collector._navigate_spa(page, target_url)
             time.sleep(3)
             self._collector._check_page_anomalies(page)
 
