@@ -21,13 +21,7 @@ from .contracts import (
     SourceHashMismatchError,
     SynthesizerConfig,
 )
-from .future_contracts import (
-    ClaimType,
-    ClaimTypeInvalidError,
-    CrossNoteSynthesisError,
-    DigestClaim,
-    HumanReviewState,
-)
+from .extractor import EvidenceExtractor
 from .retriever import VaultRetriever
 from .validator import ProvenanceValidator, ValidationError, ValidationResult
 
@@ -36,6 +30,7 @@ __all__ = [
     "IndexResult",
     "sanitize_url",
     "VaultRetriever",
+    "EvidenceExtractor",
     "ProvenanceValidator",
     "ValidationResult",
     "ValidationError",
@@ -57,10 +52,4 @@ __all__ = [
     "EvidenceNoteNotInBundleError",
     "SourceHashMismatchError",
     "QuoteSubstringMismatchError",
-    # Future contract exports
-    "DigestClaim",
-    "ClaimType",
-    "HumanReviewState",
-    "CrossNoteSynthesisError",
-    "ClaimTypeInvalidError",
 ]

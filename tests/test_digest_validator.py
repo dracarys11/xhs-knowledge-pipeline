@@ -7,6 +7,10 @@ Verifies:
 4. Quote mismatch fails with QUOTE_NOT_FOUND.
 5. Deterministic validation order and omission handling for multiple excerpts.
 6. Absolute immutability of EvidenceBundle and EvidenceExcerpt inputs.
+7. Empty evidence list fails closed with EMPTY_EVIDENCE and is_valid=False.
+8. None input item is handled safely (omitted with MALFORMED_EXCERPT, no crash).
+9. Malformed field types and invalid objects produce MALFORMED_EXCERPT without crashing.
+10. Mixed input (valid, None, malformed, invalid quote) partitions cleanly and deterministically.
 """
 
 import copy
@@ -206,3 +210,152 @@ def test_validator_input_immutability(sample_bundle: EvidenceBundle):
 
     assert sample_bundle.to_dict() == bundle_snapshot, "EvidenceBundle mutated during validation!"
     assert excerpt.to_dict() == excerpt_snapshot, "EvidenceExcerpt mutated during validation!"
+
+
+def test_empty_excerpt_list_fails_closed(sample_bundle: EvidenceBundle):
+    """Empty excerpt list must fail closed with EMPTY_EVIDENCE and is_valid=False."""
+    validator = ProvenanceValidator()
+
+    # Empty list
+    res = validator.validate([], sample_bundle)
+    assert res.status == "FAILED"
+    assert res.is_valid is False
+    assert res.validated_count == 0
+    assert res.failed_count == 0
+    assert len(res.errors) == 1
+    assert res.errors[0].code == "EMPTY_EVIDENCE"
+    assert res.validated_excerpts == []
+    assert res.omitted_excerpts == []
+    assert res.to_dict() == {
+        "status": "FAILED",
+        "validated_count": 0,
+        "failed_count": 0,
+        "errors": [
+            {
+                "code": "EMPTY_EVIDENCE",
+                "note_id": "",
+                "message": "Evidence excerpt list is empty; zero evidence cannot be validated as PASS.",
+                "quote_preview": "",
+            }
+        ],
+    }
+
+    # None input
+    res_none = validator.validate(None, sample_bundle)
+    assert res_none.status == "FAILED"
+    assert res_none.is_valid is False
+    assert res_none.validated_count == 0
+    assert res_none.failed_count == 0
+    assert len(res_none.errors) == 1
+    assert res_none.errors[0].code == "EMPTY_EVIDENCE"
+
+
+def test_none_input_item_handled_safely(sample_bundle: EvidenceBundle):
+    """None item inside excerpt list must be omitted with MALFORMED_EXCERPT without raising AttributeError."""
+    validator = ProvenanceValidator()
+
+    res = validator.validate([None], sample_bundle)
+    assert res.status == "FAILED"
+    assert res.is_valid is False
+    assert res.validated_count == 0
+    assert res.failed_count == 1
+    assert res.omitted_excerpts == [None]
+    assert len(res.errors) == 1
+    assert res.errors[0].code == "MALFORMED_EXCERPT"
+    assert "None" in res.errors[0].message
+
+
+def test_malformed_field_type_handled_safely(sample_bundle: EvidenceBundle):
+    """Non-string field types and wrong object types must produce MALFORMED_EXCERPT without crashing."""
+    validator = ProvenanceValidator()
+
+    # Wrong object types
+    res_dict = validator.validate([{"note_id": "note_001"}], sample_bundle)
+    assert res_dict.status == "FAILED"
+    assert res_dict.is_valid is False
+    assert res_dict.failed_count == 1
+    assert res_dict.errors[0].code == "MALFORMED_EXCERPT"
+    assert "dict" in res_dict.errors[0].message
+
+    res_str = validator.validate(["just a string"], sample_bundle)
+    assert res_str.status == "FAILED"
+    assert res_str.errors[0].code == "MALFORMED_EXCERPT"
+
+    # Duck-typed object with non-string fields
+    class BadExcerpt:
+        note_id = 123
+        source_file_sha256 = "sha256_note1_abc123"
+        verbatim_quote = "CAP定理是基础。"
+
+    res_bad_type = validator.validate([BadExcerpt()], sample_bundle)
+    assert res_bad_type.status == "FAILED"
+    assert res_bad_type.errors[0].code == "MALFORMED_EXCERPT"
+
+    # Duck-typed object with empty/whitespace fields
+    class EmptyFieldExcerpt:
+        note_id = "   "
+        source_file_sha256 = "sha256_note1_abc123"
+        verbatim_quote = "CAP定理是基础。"
+
+    res_empty_field = validator.validate([EmptyFieldExcerpt()], sample_bundle)
+    assert res_empty_field.status == "FAILED"
+    assert res_empty_field.errors[0].code == "MALFORMED_EXCERPT"
+
+
+def test_mixed_valid_and_malformed_input(sample_bundle: EvidenceBundle):
+    """Safely processes mixed input of valid, None, malformed, and tampered items without crashing."""
+    validator = ProvenanceValidator()
+
+    valid1 = EvidenceExcerpt(
+        note_id="note_001",
+        source_file_sha256="sha256_note1_abc123",
+        verbatim_quote="CAP定理是基础。",
+    )
+    valid2 = EvidenceExcerpt(
+        note_id="note_002",
+        source_file_sha256="sha256_note2_def456",
+        verbatim_quote="支持脚本化集成。",
+    )
+    bad_hash = EvidenceExcerpt(
+        note_id="note_001",
+        source_file_sha256="wrong_sha256",
+        verbatim_quote="CAP定理是基础。",
+    )
+    bad_quote = EvidenceExcerpt(
+        note_id="note_002",
+        source_file_sha256="sha256_note2_def456",
+        verbatim_quote="根本不存在的内容",
+    )
+
+    candidates = [
+        valid1,
+        None,
+        {"some": "data"},
+        bad_hash,
+        valid2,
+        "raw_string",
+        bad_quote,
+    ]
+
+    result = validator.validate(candidates, sample_bundle)
+
+    assert result.status == "FAILED"
+    assert result.is_valid is False
+    assert result.validated_count == 2
+    assert result.failed_count == 5
+    assert result.validated_excerpts == [valid1, valid2]
+    assert result.omitted_excerpts == [
+        None,
+        {"some": "data"},
+        bad_hash,
+        "raw_string",
+        bad_quote,
+    ]
+    error_codes = [e.code for e in result.errors]
+    assert error_codes == [
+        "MALFORMED_EXCERPT",
+        "MALFORMED_EXCERPT",
+        "SOURCE_HASH_MISMATCH",
+        "MALFORMED_EXCERPT",
+        "QUOTE_NOT_FOUND",
+    ]
