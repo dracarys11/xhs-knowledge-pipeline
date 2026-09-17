@@ -2,7 +2,12 @@
 
 ## Status
 
-**FROZEN EPISTEMIC CONTRACT — Structural Provenance Gate for Phase C.2.**
+**DEFERRED PENDING MISSION — Structural provenance design beyond the Phase C
+MVP.**
+
+The Phase C MVP scope is defined by `PHASE_C_MVP_SCOPE_REVIEW.md`. This
+document is retained for a later, explicitly approved semantic-provenance
+phase and does not authorize implementation.
 
 ---
 

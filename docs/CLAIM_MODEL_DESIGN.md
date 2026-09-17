@@ -3,7 +3,11 @@
 
 ## Status
 
-**DRAFT DESIGN CONTRACT FOR CODEX AUDIT — Implementation frozen until approved.**
+**DEFERRED PENDING MISSION — Not part of the Phase C MVP.**
+
+The Phase C MVP scope is defined by `PHASE_C_MVP_SCOPE_REVIEW.md`. This
+document remains design input for a later semantic-provenance phase and does
+not authorize implementation.
 
 ---
 
