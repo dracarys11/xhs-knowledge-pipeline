@@ -12,7 +12,7 @@ This project explores a fundamental question in personal data infrastructure:
 
 **How can personal platform data become:**
 - **Portable**: Exported into open Markdown and locally stored assets for tools like Obsidian.
-- **Traceable**: Grounded in immutable cryptographic proof of remote server responses.
+- **Traceable**: Grounded in integrity-checked evidence artifacts with cryptographic checksums.
 - **Locally Searchable**: Structured by collections, permanent primary keys, and human-readable aliases.
 - **Safe to Process with AI**: Sanitized of tracking tokens and session credentials before offline LLM consumption.
 
@@ -45,7 +45,7 @@ This project explores a fundamental question in personal data infrastructure:
                               │
                               ▼
                    AI-assisted Consumption
-                    (Offline Reasoning & RAG)
+                    (Offline Synthesis & Attribution)
 ```
 
 > **Design Boundary**: The acquisition layer and consumption layer are strictly decoupled. The AI Agent never browses or scrapes remote platforms directly; it operates 100% offline over validated local vaults.
@@ -75,7 +75,7 @@ Decision:       UNKNOWN
 ### Core Guarantees
 
 1. **Evidence Hygiene Gate**: All URLs entering the Obsidian Vault are stripped of platform security signatures (`xsec_token`, `xsec_source`), referral tags (`utm_*`, `spm`), and session parameters, normalizing to bare canonical URLs (`https://www.xiaohongshu.com/explore/<note_id>`).
-2. **Zero-Mutation Isolation Guard**: The projection layer treats underlying P1 storage (`data/` and `.xhs-state/sync.db`) as strictly read-only. Pre/post SHA256 checksums verify **0 bytes modified** during indexing.
+2. **Read-Only Boundary Protection**: The projection layer treats underlying P1 storage (`data/` and `.xhs-state/sync.db`) as strictly read-only, enforced by physical path boundaries. Pre- and post-run SHA256 checksums verify that no mutation was observed during projection execution.
 3. **Database-Style Naming (Primary Key + Alias)**:
    - Notes are stored by immutable ID: `notes/<note_id>.md`.
    - Titles change, contain emojis, or collide; `note_id` never does.
@@ -173,7 +173,7 @@ Rather than raw test counts, the test suite emphasizes verification across criti
 
 - [x] **Phase A**: Synthetic demo fixtures & offline collection projection.
 - [x] **Phase B**: Evidence-first documentation, demo story, and v0.3 public milestone.
-- [ ] **Phase C**: Offline Agent prototype (daily knowledge synthesis and backlinks over local Vault).
+- [ ] **Phase C**: Daily Digest Agent v0.1 (offline note retriever + LLM synthesis with mandatory backlinks).
 - [ ] **Phase D**: Multi-source connector abstractions (GitHub Stars, Reddit Saved, RSS).
 
 ---
