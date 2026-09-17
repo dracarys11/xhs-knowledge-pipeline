@@ -29,12 +29,16 @@ from .future_contracts import (
     HumanReviewState,
 )
 from .retriever import VaultRetriever
+from .validator import ProvenanceValidator, ValidationError, ValidationResult
 
 __all__ = [
     "CollectionIndexer",
     "IndexResult",
     "sanitize_url",
     "VaultRetriever",
+    "ProvenanceValidator",
+    "ValidationResult",
+    "ValidationError",
     "DigestRequest",
     "SourceConfig",
     "SelectionConfig",
