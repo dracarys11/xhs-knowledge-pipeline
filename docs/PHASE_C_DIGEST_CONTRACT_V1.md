@@ -113,13 +113,25 @@ Represents a single admitted source note with cryptographic integrity:
   "note_id": "6aa174a8000000002901b985",
   "title": "东京必吃list✨5家平价米其林&顶美饭",
   "author_name": "西资卡",
+  "primary_collection": "吃",
+  "vault_collection_position": 4,
+  "memberships": [
+    {
+      "collection_id": "6a9998ba000000002402ff99",
+      "collection_name": "吃",
+      "vault_collection_position": 4
+    }
+  ],
   "collections": ["吃"],
   "content_text": "来东京不知道吃什么？卡姐建议先把这5家存进收藏夹！...",
   "file_path": "notes/6aa174a8000000002901b985.md",
-  "file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "collection_position": 4
+  "file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 }
 ```
+
+> [!IMPORTANT]
+> **Collection Position Provenance Disclaimer**:
+> `vault_collection_position` represents ordering inside the local Vault collection markdown projection (`Vault/collections/<name>.md`). It is **not** evidence of original platform ordering.
 
 ---
 
@@ -142,9 +154,8 @@ The complete, sealed input payload passed into the Synthesizer:
 evidence of when the user saved, viewed, authored, or interacted with it, and
 must not be used as a Phase C time filter or ranking signal in v0.1.
 
-For v0.1, selection is bounded by an explicitly named collection and its
-observed relationship order: `collection_position ASC`, then `note_id ASC`.
-The collection order in `DigestRequest.source.collections` is also preserved.
+For v0.1, selection is bounded by explicitly named collections and their
+observed relationship order: `primary_collection` priority (matching `DigestRequest.source.collections` order), then `vault_collection_position ASC`, then `note_id ASC`.
 If evidence does not supply a stable membership position, the request must fail
 closed rather than substitute `indexed_at`, filesystem mtime, or ingestion time.
 

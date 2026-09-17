@@ -16,6 +16,7 @@ from typing import Any
 
 from xhs_knowledge.contracts import (
     BoundaryViolationError,
+    CollectionMembership,
     DigestRequest,
     EmptySelectionError,
     EvidenceBundle,
@@ -66,6 +67,55 @@ def validate_retriever_boundary(
             raise BoundaryViolationError(
                 f"State directory ({resolved_state}) cannot be inside vault directory ({resolved_vault})"
             )
+
+
+def safe_validate_vault_path(path: Path, vault_root: Path, *, label: str = "path") -> Path:
+    """Pre-read physical boundary validator.
+
+    Must be called BEFORE any open, read, or metadata access.
+    Strictly forbids symlinks and paths escaping vault_root.
+    """
+    # 1. Symlink check using os.path.islink (inspects link itself without dereferencing)
+    if os.path.islink(path):
+        raise BoundaryViolationError(
+            f"Boundary violation: symlinks are strictly forbidden inside Vault ({path})"
+        )
+
+    # 2. Escape check
+    resolved_vault = vault_root.resolve()
+    resolved_path = path.resolve()
+
+    try:
+        resolved_path.relative_to(resolved_vault)
+    except ValueError:
+        raise BoundaryViolationError(
+            f"Boundary violation: {label} ({resolved_path}) escapes Vault root ({resolved_vault})"
+        )
+
+    return path
+
+
+def safe_iter_markdown_files(directory: Path, vault_root: Path) -> list[Path]:
+    """Safely iterates markdown files inside a directory without following or reading unvalidated symlinks."""
+    safe_validate_vault_path(directory, vault_root, label="directory")
+    if not directory.exists() or not directory.is_dir():
+        return []
+
+    valid_files: list[Path] = []
+    with os.scandir(directory) as it:
+        entries = sorted(list(it), key=lambda e: e.name)
+        for entry in entries:
+            p = Path(entry.path)
+            # Check symlink BEFORE is_file / reading
+            if entry.is_symlink() or os.path.islink(p):
+                raise BoundaryViolationError(
+                    f"Boundary violation: symlink detected inside Vault directory: {p}"
+                )
+            if entry.is_file() and p.name.endswith(".md"):
+                safe_validate_vault_path(p, vault_root, label="markdown file")
+                valid_files.append(p)
+
+    return valid_files
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -142,36 +192,29 @@ class VaultRetriever:
         vault_dir: Path | str = DEFAULT_VAULT_DIR,
         data_dir: Path | str | None = DEFAULT_DATA_DIR,
         state_dir: Path | str | None = DEFAULT_STATE_DIR,
+        *,
+        allow_unisolated_vault: bool = False,
     ) -> None:
         self.vault_dir = Path(vault_dir)
         self.data_dir = Path(data_dir) if data_dir else None
         self.state_dir = Path(state_dir) if state_dir else None
+        self.allow_unisolated_vault = allow_unisolated_vault
+
+        if not self.allow_unisolated_vault:
+            if self.data_dir is None or self.state_dir is None:
+                raise BoundaryViolationError(
+                    "data_dir and state_dir must be configured for boundary isolation. "
+                    "Set allow_unisolated_vault=True explicitly if running in a hermetic test."
+                )
 
         validate_retriever_boundary(self.vault_dir, self.data_dir, self.state_dir)
 
         self.notes_dir = self.vault_dir / "notes"
         self.collections_dir = self.vault_dir / "collections"
 
-    def _require_inside_vault(self, path: Path, label: str = "path") -> Path:
-        """Ensures path resides strictly within vault_dir and is not a symlink escaping it."""
-        try:
-            resolved = path.resolve()
-            resolved_vault = self.vault_dir.resolve()
-            if resolved != resolved_vault and resolved_vault not in resolved.parents:
-                raise BoundaryViolationError(
-                    f"Boundary violation: {label} ({resolved}) escapes Vault root ({resolved_vault})"
-                )
-            if path.exists() and path.is_symlink():
-                raise BoundaryViolationError(f"Symlinks forbidden inside Vault for safety: {path}")
-            return path
-        except Exception as exc:
-            if isinstance(exc, BoundaryViolationError):
-                raise
-            raise BoundaryViolationError(f"Failed boundary check for {path}: {exc}") from exc
-
     def parse_note_file(self, note_path: Path) -> dict[str, Any]:
         """Parses a note markdown file in Vault/notes/ into constituent fields."""
-        self._require_inside_vault(note_path, label="note file")
+        safe_validate_vault_path(note_path, self.vault_dir, label="note file")
         if not note_path.is_file():
             raise InvalidNoteContentError(f"Note file does not exist or is not a file: {note_path}")
 
@@ -188,7 +231,6 @@ class VaultRetriever:
         content_text = extract_note_content_text(body)
         file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
-        # Relative path from vault_dir
         rel_path = str(note_path.relative_to(self.vault_dir))
 
         return {
@@ -210,7 +252,7 @@ class VaultRetriever:
             where each entry is:
             {"note_id": str, "position": int, "title_alias": str, "author_alias": str, "is_pending": bool}
         """
-        self._require_inside_vault(collection_path, label="collection file")
+        safe_validate_vault_path(collection_path, self.vault_dir, label="collection file")
         if not collection_path.is_file():
             raise SelectionPositionMissingError(f"Collection file not found: {collection_path}")
 
@@ -219,7 +261,6 @@ class VaultRetriever:
         cid = meta.get("collection_id") or collection_path.stem
         cname = meta.get("name") or collection_path.stem
 
-        # Parse notes list under ## 收藏笔记
         members: list[dict[str, Any]] = []
         in_notes_section = False
         pos = 1
@@ -232,7 +273,6 @@ class VaultRetriever:
             if in_notes_section:
                 if line_stripped.startswith("## "):
                     break
-                # Match: - [[note_id|title]] *(待导出)* — *author*
                 m = re.match(
                     r"^\s*-\s+\[\[([^\|\]]+)(?:\|([^\]]*))?\]\](?:\s+\*\((待导出)\)\*)?(?:\s+—\s+\*([^*]+)\*)?",
                     line,
@@ -262,11 +302,13 @@ class VaultRetriever:
         return cid, cname, members
 
     def _resolve_collection_paths(self, collection_names: list[str]) -> list[tuple[str, Path]]:
-        """Resolves collection names to paths deterministically."""
+        """Resolves collection names to paths deterministically, validating paths BEFORE reading."""
         if not self.collections_dir.exists():
             return []
 
-        existing_files = sorted(list(self.collections_dir.glob("*.md")))
+        # Safe iteration: checks symlinks before reading any content
+        existing_files = safe_iter_markdown_files(self.collections_dir, self.vault_dir)
+
         # Build lookup table: name -> path and filename_stem -> path
         name_to_path: dict[str, Path] = {}
         for cp in existing_files:
@@ -306,24 +348,35 @@ class VaultRetriever:
                 f"No collections found matching request source {request.source.collections}"
             )
 
+        # Build collection priority index
+        collection_priority_index = {
+            coll_name: idx for idx, (coll_name, _) in enumerate(target_collections)
+        }
+
         # Map note_id -> SelectedNote
         selected_map: dict[str, SelectedNote] = {}
 
         for coll_name, coll_path in target_collections:
-            _, real_cname, members = self.parse_collection_file(coll_path)
+            cid, real_cname, members = self.parse_collection_file(coll_path)
             for item in members:
                 note_id = item["note_id"]
                 pos = item["position"]
                 is_pending = item["is_pending"]
 
                 if is_pending:
-                    # Note not exported into Vault yet
                     continue
 
+                membership = CollectionMembership(
+                    collection_id=cid,
+                    collection_name=real_cname,
+                    vault_collection_position=pos,
+                )
+
                 if note_id in selected_map:
-                    # Note already observed, append collection if not present
-                    if real_cname not in selected_map[note_id].collections:
-                        selected_map[note_id].collections.append(real_cname)
+                    # Multi-collection provenance: record membership without overwriting primary provenance
+                    existing = selected_map[note_id]
+                    if not any(m.collection_id == cid for m in existing.memberships):
+                        existing.memberships.append(membership)
                     continue
 
                 note_path = self.notes_dir / f"{note_id}.md"
@@ -335,6 +388,9 @@ class VaultRetriever:
                     )
                     continue
 
+                # Pre-read boundary check before parse
+                safe_validate_vault_path(note_path, self.vault_dir, label="note file")
+
                 try:
                     note_info = self.parse_note_file(note_path)
                 except Exception as exc:
@@ -342,12 +398,12 @@ class VaultRetriever:
                     continue
 
                 content_text = note_info["content_text"]
-                # Enforce NOTE_CONTENT_EMPTY: skip notes with zero body text
+                # Enforce NOTE_CONTENT_EMPTY
                 if not content_text:
                     logger.warning("Excluding note %s from selection: NOTE_CONTENT_EMPTY", note_id)
                     continue
 
-                # Title resolution: frontmatter title -> collection alias -> note_id
+                # Title resolution
                 resolved_title = note_info["title"]
                 if not resolved_title or resolved_title == "无标题笔记":
                     if item["title_alias"]:
@@ -355,18 +411,19 @@ class VaultRetriever:
                     else:
                         resolved_title = resolved_title or f"笔记 {note_id}"
 
-                # Author resolution: frontmatter author -> collection alias
+                # Author resolution
                 resolved_author = note_info["author_name"] or item["author_alias"]
 
                 selected_map[note_id] = SelectedNote(
                     note_id=note_id,
                     title=resolved_title,
                     author_name=resolved_author,
-                    collections=[real_cname],
+                    primary_collection=real_cname,
+                    vault_collection_position=pos,
+                    memberships=[membership],
                     content_text=content_text,
                     file_path=note_info["file_path"],
                     file_sha256=note_info["file_sha256"],
-                    collection_position=pos,
                 )
 
         if not selected_map:
@@ -374,11 +431,17 @@ class VaultRetriever:
                 f"0 notes matched selection criteria for digest '{request.digest_name}'"
             )
 
-        # Deterministic sorting: order_by in v0.1 is ["collection_position ASC", "note_id ASC"]
-        # Python's sort on tuple (collection_position, note_id) guarantees exact determinism
+        # Deterministic multi-collection sorting:
+        # 1. Collection priority index (preserves request.source.collections priority)
+        # 2. vault_collection_position ASC
+        # 3. note_id ASC
         notes_list = sorted(
             selected_map.values(),
-            key=lambda n: (n.collection_position, n.note_id),
+            key=lambda n: (
+                collection_priority_index.get(n.primary_collection, 999999),
+                n.vault_collection_position,
+                n.note_id,
+            ),
         )
 
         # Enforce max_notes ceiling

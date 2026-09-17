@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -90,17 +91,31 @@ class DigestRequest:
             raise ValueError("digest_name must be a non-empty string")
         if not self.target_date or not self.target_date.strip():
             raise ValueError("target_date must be a non-empty string")
+
+        # Strict YYYY-MM-DD format validation
+        try:
+            datetime.strptime(self.target_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(
+                f"target_date must follow strict 'YYYY-MM-DD' format, got {self.target_date!r}"
+            ) from exc
+
         if self.selection.max_notes <= 0:
             raise ValueError("selection.max_notes must be positive")
         if self.selection.max_notes > 50:
             raise ValueError("selection.max_notes cannot exceed hard ceiling of 50")
 
         # Validate order_by for v0.1: ["collection_position ASC", "note_id ASC"]
-        allowed_orders = [["collection_position ASC", "note_id ASC"], ["collection_position ASC"]]
+        allowed_orders = [
+            ["collection_position ASC", "note_id ASC"],
+            ["vault_collection_position ASC", "note_id ASC"],
+            ["collection_position ASC"],
+            ["vault_collection_position ASC"],
+        ]
         if self.selection.order_by not in allowed_orders:
             raise ValueError(
                 f"Unsupported order_by in v0.1: {self.selection.order_by}. "
-                "Only ['collection_position ASC', 'note_id ASC'] is permitted."
+                "Only ['vault_collection_position ASC', 'note_id ASC'] (or legacy alias) is permitted."
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -113,18 +128,54 @@ class DigestRequest:
 
 
 @dataclass
-class SelectedNote:
-    note_id: str
-    title: str
-    author_name: str
-    collections: list[str]
-    content_text: str
-    file_path: str
-    file_sha256: str
-    collection_position: int
+class CollectionMembership:
+    """Provenance record for a note's presence inside a specific collection markdown projection.
+
+    Note: vault_collection_position represents ordering inside the local Vault collection projection.
+    It is not evidence of original platform ordering.
+    """
+    collection_id: str
+    collection_name: str
+    vault_collection_position: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class SelectedNote:
+    """Admitted source note with cryptographic integrity and collection provenance.
+
+    Note: vault_collection_position represents ordering inside the local Vault collection projection.
+    It is not evidence of original platform ordering.
+    """
+    note_id: str
+    title: str
+    author_name: str
+    primary_collection: str
+    vault_collection_position: int
+    memberships: list[CollectionMembership]
+    content_text: str
+    file_path: str
+    file_sha256: str
+
+    @property
+    def collections(self) -> list[str]:
+        """Convenience accessor for collection names."""
+        if self.memberships:
+            return [m.collection_name for m in self.memberships]
+        return [self.primary_collection] if self.primary_collection else []
+
+    @property
+    def collection_position(self) -> int:
+        """Backward-compatible alias for vault_collection_position."""
+        return self.vault_collection_position
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["collections"] = self.collections
+        d["collection_position"] = self.vault_collection_position
+        return d
 
 
 @dataclass
@@ -147,7 +198,7 @@ class EvidenceBundle:
         """
         h = hashlib.sha256()
         for n in self.notes:
-            line = f"{n.note_id}:{n.file_sha256}:{n.collection_position}\n"
+            line = f"{n.note_id}:{n.file_sha256}:{n.primary_collection}:{n.vault_collection_position}\n"
             h.update(line.encode("utf-8"))
         return h.hexdigest()
 

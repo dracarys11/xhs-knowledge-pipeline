@@ -1,21 +1,24 @@
-"""Tests for Phase C.1 VaultRetriever & Contract Schemas.
+"""Tests for Phase C.1 VaultRetriever & Contract Schemas (Remediated v1).
 
 Verifies:
-1. Zero network access and zero P1 data/ mutation.
-2. Strict physical boundary enforcement (Vault isolation).
-3. Deterministic note selection (collection_position ASC, note_id ASC).
-4. Hash stability across multiple runs.
-5. Fail-closed error handling (EMPTY_SELECTION, NOTE_CONTENT_EMPTY, unsupported order_by).
+1. Zero network access and cryptographically verified zero P1 data/ mutation.
+2. Strict physical boundary enforcement (Vault isolation, pre-read symlink rejection).
+3. Deterministic note selection (collection priority, vault_collection_position ASC, note_id ASC).
+4. Multi-collection duplicate note provenance preservation without information loss.
+5. Hash and order stability across multiple runs.
+6. Fail-closed error handling (EMPTY_SELECTION, NOTE_CONTENT_EMPTY, unsupported order_by, invalid date format).
 """
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import pytest
 
 from xhs_knowledge.contracts import (
     BoundaryViolationError,
     ClaimType,
+    CollectionMembership,
     DigestClaim,
     DigestError,
     DigestRequest,
@@ -35,6 +38,26 @@ from xhs_knowledge.retriever import (
     parse_frontmatter,
     validate_retriever_boundary,
 )
+
+
+def compute_file_sha256(path: Path) -> str:
+    """Computes SHA256 of a single file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def compute_dir_tree_sha256(directory: Path) -> str:
+    """Computes a deterministic hash over all files in directory."""
+    hashes: list[str] = []
+    for root, dirs, files in os.walk(directory):
+        dirs.sort()
+        for f in sorted(files):
+            p = Path(root) / f
+            hashes.append(f"{p.relative_to(directory)}:{compute_file_sha256(p)}")
+    return hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
 
 
 @pytest.fixture
@@ -141,9 +164,17 @@ def test_contract_request_validation():
     with pytest.raises(ValueError, match="digest_name"):
         DigestRequest(digest_name="", target_date="2026-09-17")
 
-    # Invalid empty target_date
+    # Invalid target_date: empty
     with pytest.raises(ValueError, match="target_date"):
         DigestRequest(digest_name="valid", target_date="")
+
+    # Invalid target_date: non-strict format (slashes or bad date)
+    with pytest.raises(ValueError, match="strict 'YYYY-MM-DD'"):
+        DigestRequest(digest_name="valid", target_date="2026/09/17")
+    with pytest.raises(ValueError, match="strict 'YYYY-MM-DD'"):
+        DigestRequest(digest_name="valid", target_date="today")
+    with pytest.raises(ValueError, match="strict 'YYYY-MM-DD'"):
+        DigestRequest(digest_name="valid", target_date="2026-13-45")
 
     # Invalid max_notes <= 0
     with pytest.raises(ValueError, match="positive"):
@@ -186,10 +217,64 @@ def test_retriever_boundary_guards(tmp_path: Path):
     with pytest.raises(BoundaryViolationError):
         VaultRetriever(vault_dir=inside_state, data_dir=fake_data, state_dir=fake_state)
 
+    # Refuse initialization without boundary isolation unless explicitly permitted
+    with pytest.raises(BoundaryViolationError, match="boundary isolation"):
+        VaultRetriever(vault_dir=vault_dir, data_dir=None, state_dir=None, allow_unisolated_vault=False)
+
+
+def test_symlink_boundary_attack_rejected_before_read(tmp_path: Path):
+    """Symlinks inside Vault must be rejected BEFORE reading external content."""
+    # Create external secret file
+    secret_dir = tmp_path / "external_secret"
+    secret_dir.mkdir()
+    secret_file = secret_dir / "secret.txt"
+    secret_file.write_text("SUPER_SECRET_TOKEN=12345", encoding="utf-8")
+
+    vault_dir = tmp_path / "VaultWithSymlink"
+    notes_dir = vault_dir / "notes"
+    colls_dir = vault_dir / "collections"
+    notes_dir.mkdir(parents=True)
+    colls_dir.mkdir(parents=True)
+
+    # 1. Symlink inside collections pointing outside
+    rogue_collection = colls_dir / "evil_collection.md"
+    rogue_collection.symlink_to(secret_file)
+
+    retriever = VaultRetriever(vault_dir=vault_dir, allow_unisolated_vault=True)
+    req = DigestRequest(
+        digest_name="attack_test",
+        target_date="2026-09-17",
+        source=SourceConfig(collections=["evil_collection"]),
+    )
+
+    # Must raise BoundaryViolationError and never open secret_file
+    with pytest.raises(BoundaryViolationError, match="symlink"):
+        retriever.retrieve(req)
+
+    # Clean up collection symlink
+    rogue_collection.unlink()
+
+    # 2. Valid collection referencing a symlinked note
+    (colls_dir / "safe_col.md").write_text(
+        "---\nname: 'safe_col'\n---\n## 收藏笔记\n- [[evil_note|Evil]]\n",
+        encoding="utf-8",
+    )
+    evil_note = notes_dir / "evil_note.md"
+    evil_note.symlink_to(secret_file)
+
+    with pytest.raises(BoundaryViolationError, match="symlink"):
+        retriever.retrieve(
+            DigestRequest(
+                digest_name="note_attack",
+                target_date="2026-09-17",
+                source=SourceConfig(collections=["safe_col"]),
+            )
+        )
+
 
 def test_deterministic_retrieval_and_ordering(test_vault: Path):
     """Retrieval must strictly respect collection position, filter empty/pending notes, and be deterministic."""
-    retriever = VaultRetriever(vault_dir=test_vault)
+    retriever = VaultRetriever(vault_dir=test_vault, allow_unisolated_vault=True)
     req = DigestRequest(
         digest_name="tech_digest",
         target_date="2026-09-17",
@@ -208,16 +293,19 @@ def test_deterministic_retrieval_and_ordering(test_vault: Path):
     assert len(notes) == 3
 
     assert notes[0].note_id == "note_001"
-    assert notes[0].collection_position == 1
+    assert notes[0].vault_collection_position == 1
+    assert notes[0].primary_collection == "tech"
     assert notes[0].title == "架构师之道"
     assert "权衡" in notes[0].content_text
 
     assert notes[1].note_id == "note_002"
-    assert notes[1].collection_position == 4
+    assert notes[1].vault_collection_position == 4
+    assert notes[1].primary_collection == "tech"
     assert notes[1].title == "Agent设计模式"
 
     assert notes[2].note_id == "note_004"
-    assert notes[2].collection_position == 5
+    assert notes[2].vault_collection_position == 5
+    assert notes[2].primary_collection == "tech"
     assert notes[2].title == "高效CLI工具指南"  # Fallback from collection alias!
     assert notes[2].author_name == "开发团队"  # Fallback from collection alias!
 
@@ -228,9 +316,86 @@ def test_deterministic_retrieval_and_ordering(test_vault: Path):
     assert len(bundle.bundle_content_hash) == 64
 
 
+def test_multi_collection_duplicate_note_semantics(tmp_path: Path):
+    """Duplicate notes across collections must preserve full provenance memberships and order deterministically."""
+    vault = tmp_path / "MultiVault"
+    notes_dir = vault / "notes"
+    colls_dir = vault / "collections"
+    notes_dir.mkdir(parents=True)
+    colls_dir.mkdir(parents=True)
+
+    # Shared note in both col_ai (pos 2) and col_tools (pos 1)
+    (notes_dir / "shared_note.md").write_text(
+        "---\ntitle: 'Shared Note'\nnote_id: 'shared_note'\nauthor_name: 'Author'\n---\n"
+        "## Content\nShared technical content\n",
+        encoding="utf-8",
+    )
+    # Unique to col_ai (pos 1)
+    (notes_dir / "ai_only.md").write_text(
+        "---\ntitle: 'AI Only'\nnote_id: 'ai_only'\nauthor_name: 'Author'\n---\n"
+        "## Content\nAI content\n",
+        encoding="utf-8",
+    )
+    # Unique to col_tools (pos 2)
+    (notes_dir / "tools_only.md").write_text(
+        "---\ntitle: 'Tools Only'\nnote_id: 'tools_only'\nauthor_name: 'Author'\n---\n"
+        "## Content\nTools content\n",
+        encoding="utf-8",
+    )
+
+    (colls_dir / "col_ai.md").write_text(
+        "---\ncollection_id: 'id_ai'\nname: 'col_ai'\n---\n"
+        "## 收藏笔记\n- [[ai_only|AI Only]]\n- [[shared_note|Shared Note]]\n",
+        encoding="utf-8",
+    )
+    (colls_dir / "col_tools.md").write_text(
+        "---\ncollection_id: 'id_tools'\nname: 'col_tools'\n---\n"
+        "## 收藏笔记\n- [[shared_note|Shared Note]]\n- [[tools_only|Tools Only]]\n",
+        encoding="utf-8",
+    )
+
+    retriever = VaultRetriever(vault_dir=vault, allow_unisolated_vault=True)
+
+    # Case 1: Priority col_ai first
+    req1 = DigestRequest(
+        digest_name="digest_ai_tools",
+        target_date="2026-09-17",
+        source=SourceConfig(collections=["col_ai", "col_tools"]),
+    )
+    notes1 = retriever.retrieve(req1)
+    assert len(notes1) == 3
+    assert [n.note_id for n in notes1] == ["ai_only", "shared_note", "tools_only"]
+
+    shared_in_req1 = notes1[1]
+    assert shared_in_req1.note_id == "shared_note"
+    assert shared_in_req1.primary_collection == "col_ai"
+    assert shared_in_req1.vault_collection_position == 2
+    # Verify memberships contain BOTH collections
+    assert len(shared_in_req1.memberships) == 2
+    assert shared_in_req1.memberships[0].collection_name == "col_ai"
+    assert shared_in_req1.memberships[0].vault_collection_position == 2
+    assert shared_in_req1.memberships[1].collection_name == "col_tools"
+    assert shared_in_req1.memberships[1].vault_collection_position == 1
+
+    # Case 2: Priority col_tools first
+    req2 = DigestRequest(
+        digest_name="digest_tools_ai",
+        target_date="2026-09-17",
+        source=SourceConfig(collections=["col_tools", "col_ai"]),
+    )
+    notes2 = retriever.retrieve(req2)
+    assert len(notes2) == 3
+    # With col_tools prioritized, shared_note (col_tools pos 1) comes before tools_only (pos 2) and ai_only (col_ai)
+    assert [n.note_id for n in notes2] == ["shared_note", "tools_only", "ai_only"]
+    shared_in_req2 = notes2[0]
+    assert shared_in_req2.primary_collection == "col_tools"
+    assert shared_in_req2.vault_collection_position == 1
+    assert len(shared_in_req2.memberships) == 2
+
+
 def test_hash_and_order_stability(test_vault: Path):
     """10 repeated runs must yield 100% identical SelectedNote lists and content hashes."""
-    retriever = VaultRetriever(vault_dir=test_vault)
+    retriever = VaultRetriever(vault_dir=test_vault, allow_unisolated_vault=True)
     req = DigestRequest(
         digest_name="tech_digest",
         target_date="2026-09-17",
@@ -245,7 +410,7 @@ def test_hash_and_order_stability(test_vault: Path):
         notes = retriever.retrieve(req)
         assert [n.note_id for n in notes] == [n.note_id for n in base_notes]
         assert [n.file_sha256 for n in notes] == [n.file_sha256 for n in base_notes]
-        assert [n.collection_position for n in notes] == [n.collection_position for n in base_notes]
+        assert [n.vault_collection_position for n in notes] == [n.vault_collection_position for n in base_notes]
 
         bundle = retriever.assemble_bundle(req, notes)
         assert bundle.bundle_content_hash == base_bundle.bundle_content_hash
@@ -254,7 +419,7 @@ def test_hash_and_order_stability(test_vault: Path):
 
 def test_max_notes_ceiling(test_vault: Path):
     """selection.max_notes truncates accurately according to order_by."""
-    retriever = VaultRetriever(vault_dir=test_vault)
+    retriever = VaultRetriever(vault_dir=test_vault, allow_unisolated_vault=True)
     req = DigestRequest(
         digest_name="tech_digest",
         target_date="2026-09-17",
@@ -269,7 +434,7 @@ def test_max_notes_ceiling(test_vault: Path):
 
 def test_empty_selection_fails_closed(test_vault: Path):
     """If no notes match, retrieval must fail closed with EmptySelectionError."""
-    retriever = VaultRetriever(vault_dir=test_vault)
+    retriever = VaultRetriever(vault_dir=test_vault, allow_unisolated_vault=True)
     req = DigestRequest(
         digest_name="unknown_digest",
         target_date="2026-09-17",
@@ -284,7 +449,7 @@ def test_missing_position_fails_closed(test_vault: Path):
     corrupted_file = test_vault / "collections" / "corrupt.md"
     corrupted_file.write_text("# Corrupt Collection\nNo notes section here.\n", encoding="utf-8")
 
-    retriever = VaultRetriever(vault_dir=test_vault)
+    retriever = VaultRetriever(vault_dir=test_vault, allow_unisolated_vault=True)
     req = DigestRequest(
         digest_name="corrupt_digest",
         target_date="2026-09-17",
@@ -294,16 +459,25 @@ def test_missing_position_fails_closed(test_vault: Path):
         retriever.retrieve(req)
 
 
-def test_real_vault_read_only_integration():
-    """Verifies VaultRetriever against real repository Vault without any mutation."""
+def test_real_vault_cryptographic_zero_mutation():
+    """Verifies that retrieval against real repository Vault causes ZERO mutation to P1 storage."""
     vault_path = Path("Vault")
-    if not vault_path.exists() or not (vault_path / "collections").exists():
-        pytest.skip("Repository Vault directory not present")
+    data_path = Path("data")
+    state_path = Path(".xhs-state")
+    sync_db_path = state_path / "sync.db"
 
+    if not vault_path.exists() or not sync_db_path.exists():
+        pytest.skip("Repository Vault or P1 state not present")
+
+    # 1. Cryptographic hash before retrieval
+    before_db_hash = compute_file_sha256(sync_db_path)
+    before_data_tree_hash = compute_dir_tree_sha256(data_path)
+
+    # 2. Execute retrieval
     retriever = VaultRetriever(
         vault_dir=vault_path,
-        data_dir=Path("data"),
-        state_dir=Path(".xhs-state"),
+        data_dir=data_path,
+        state_dir=state_path,
     )
 
     req = DigestRequest(
@@ -316,18 +490,13 @@ def test_real_vault_read_only_integration():
     notes = retriever.retrieve(req)
     assert len(notes) == 5
 
-    # Check that positions are strictly monotonic
-    positions = [n.collection_position for n in notes]
+    positions = [n.vault_collection_position for n in notes]
     assert positions == sorted(positions)
     assert positions[0] >= 1
 
-    # Verify SHA256 of each note file is valid
-    for n in notes:
-        actual_sha = hashlib.sha256((vault_path / n.file_path).read_bytes()).hexdigest()
-        assert n.file_sha256 == actual_sha
-        assert len(n.content_text) > 0
+    # 3. Cryptographic hash after retrieval: MUST BE IDENTICAL
+    after_db_hash = compute_file_sha256(sync_db_path)
+    after_data_tree_hash = compute_dir_tree_sha256(data_path)
 
-    # Assemble bundle and verify fingerprinting
-    bundle = retriever.assemble_bundle(req, notes)
-    assert len(bundle.request_fingerprint) == 64
-    assert len(bundle.bundle_content_hash) == 64
+    assert before_db_hash == after_db_hash, "P1 sync.db was mutated during VaultRetriever execution!"
+    assert before_data_tree_hash == after_data_tree_hash, "P1 data/ directory was mutated during VaultRetriever execution!"

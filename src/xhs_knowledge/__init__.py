@@ -4,6 +4,7 @@ from .collection_indexer import CollectionIndexer, IndexResult, sanitize_url
 from .contracts import (
     BoundaryViolationError,
     ClaimType,
+    CollectionMembership,
     DigestClaim,
     DigestError,
     DigestRequest,
@@ -30,6 +31,7 @@ __all__ = [
     "SelectionConfig",
     "SynthesizerConfig",
     "SelectedNote",
+    "CollectionMembership",
     "EvidenceBundle",
     "DigestClaim",
     "ClaimType",
