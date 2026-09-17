@@ -49,12 +49,10 @@ timed out and remains retryable.
 
 ## Pending Problems
 
-- Server completion-signal detection / enumeration proof
-- One `MEDIA_PARTIAL` record
-- One retryable detail-fetch navigation timeout
-- Token-refresh recovery validation
-- CDN/DNS behavior outside a trusted host environment
-- Edge-page compatibility
+Archived in [docs/pending/](pending/README.md):
+- [P1_REMOTE_COVERAGE_PROOF.md](pending/P1_REMOTE_COVERAGE_PROOF.md)
+- [P1_FINAL_FAILED_TIMEOUT.md](pending/P1_FINAL_FAILED_TIMEOUT.md)
+- [P1_LARGE_MEDIA_RECOVERY.md](pending/P1_LARGE_MEDIA_RECOVERY.md)
 
 These remain pending problems. They are not a reason to expand architecture,
 state vocabulary, retry policy, or verifier layers unless they directly block
