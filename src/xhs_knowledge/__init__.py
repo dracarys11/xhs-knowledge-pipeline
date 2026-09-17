@@ -1,13 +1,9 @@
-"""P2.2b Knowledge Projection Layer: Projects collection relations and notes into Obsidian Vault views."""
+"""P2.2b Knowledge Projection Layer & Phase C Knowledge Synthesis MVP."""
 
 from .collection_indexer import CollectionIndexer, IndexResult, sanitize_url
 from .contracts import (
     BoundaryViolationError,
-    ClaimType,
-    ClaimTypeInvalidError,
     CollectionMembership,
-    CrossNoteSynthesisError,
-    DigestClaim,
     DigestError,
     DigestRequest,
     EmptyEvidenceError,
@@ -16,16 +12,21 @@ from .contracts import (
     EvidenceExcerpt,
     EvidenceNoteNotInBundleError,
     EvidenceReference,
-    HumanReviewState,
     InvalidNoteContentError,
-    QuoteSpanMismatchError,
+    QuoteSubstringMismatchError,
     SelectedNote,
     SelectionConfig,
     SelectionPositionMissingError,
     SourceConfig,
     SourceHashMismatchError,
-    SpanOutOfBoundsError,
     SynthesizerConfig,
+)
+from .future_contracts import (
+    ClaimType,
+    ClaimTypeInvalidError,
+    CrossNoteSynthesisError,
+    DigestClaim,
+    HumanReviewState,
 )
 from .retriever import VaultRetriever
 
@@ -41,9 +42,6 @@ __all__ = [
     "SelectedNote",
     "CollectionMembership",
     "EvidenceBundle",
-    "DigestClaim",
-    "ClaimType",
-    "HumanReviewState",
     "EvidenceExcerpt",
     "EvidenceReference",
     "DigestError",
@@ -54,8 +52,11 @@ __all__ = [
     "EmptyEvidenceError",
     "EvidenceNoteNotInBundleError",
     "SourceHashMismatchError",
-    "SpanOutOfBoundsError",
-    "QuoteSpanMismatchError",
+    "QuoteSubstringMismatchError",
+    # Future contract exports
+    "DigestClaim",
+    "ClaimType",
+    "HumanReviewState",
     "CrossNoteSynthesisError",
     "ClaimTypeInvalidError",
 ]

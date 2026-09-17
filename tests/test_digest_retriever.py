@@ -17,14 +17,11 @@ import pytest
 
 from xhs_knowledge.contracts import (
     BoundaryViolationError,
-    ClaimType,
     CollectionMembership,
-    DigestClaim,
     DigestError,
     DigestRequest,
     EmptySelectionError,
     EvidenceBundle,
-    EvidenceReference,
     InvalidNoteContentError,
     SelectedNote,
     SelectionConfig,
@@ -178,18 +175,46 @@ def test_contract_request_validation():
 
     # Invalid max_notes <= 0
     with pytest.raises(ValueError, match="positive"):
-        DigestRequest(digest_name="valid", target_date="2026-09-17", selection=SelectionConfig(max_notes=0))
+        DigestRequest(
+            digest_name="valid",
+            target_date="2026-09-17",
+            source=SourceConfig(collections=["tech"]),
+            selection=SelectionConfig(max_notes=0),
+        )
 
     # Invalid max_notes > 50 (hard ceiling)
     with pytest.raises(ValueError, match="hard ceiling"):
-        DigestRequest(digest_name="valid", target_date="2026-09-17", selection=SelectionConfig(max_notes=51))
+        DigestRequest(
+            digest_name="valid",
+            target_date="2026-09-17",
+            source=SourceConfig(collections=["tech"]),
+            selection=SelectionConfig(max_notes=51),
+        )
 
     # Forbidden order_by: Attempting to rank by collected_at or user activity
     with pytest.raises(ValueError, match="Unsupported order_by"):
         DigestRequest(
             digest_name="valid",
             target_date="2026-09-17",
+            source=SourceConfig(collections=["tech"]),
             selection=SelectionConfig(order_by=["collected_at DESC"]),
+        )
+
+
+    # Invalid collections length: 0 collections
+    with pytest.raises(ValueError, match="exactly one collection"):
+        DigestRequest(
+            digest_name="valid",
+            target_date="2026-09-17",
+            source=SourceConfig(collections=[]),
+        )
+
+    # Invalid collections length: >1 collections
+    with pytest.raises(ValueError, match="exactly one collection"):
+        DigestRequest(
+            digest_name="valid",
+            target_date="2026-09-17",
+            source=SourceConfig(collections=["col_1", "col_2"]),
         )
 
 
@@ -316,8 +341,8 @@ def test_deterministic_retrieval_and_ordering(test_vault: Path):
     assert len(bundle.bundle_content_hash) == 64
 
 
-def test_multi_collection_duplicate_note_semantics(tmp_path: Path):
-    """Duplicate notes across collections must preserve full provenance memberships and order deterministically."""
+def test_single_collection_guard_and_provenance(tmp_path: Path):
+    """Multi-collection requests are rejected by guard; single collections maintain exact position."""
     vault = tmp_path / "MultiVault"
     notes_dir = vault / "notes"
     colls_dir = vault / "collections"
@@ -330,19 +355,11 @@ def test_multi_collection_duplicate_note_semantics(tmp_path: Path):
         "## Content\nShared technical content\n",
         encoding="utf-8",
     )
-    # Unique to col_ai (pos 1)
     (notes_dir / "ai_only.md").write_text(
         "---\ntitle: 'AI Only'\nnote_id: 'ai_only'\nauthor_name: 'Author'\n---\n"
         "## Content\nAI content\n",
         encoding="utf-8",
     )
-    # Unique to col_tools (pos 2)
-    (notes_dir / "tools_only.md").write_text(
-        "---\ntitle: 'Tools Only'\nnote_id: 'tools_only'\nauthor_name: 'Author'\n---\n"
-        "## Content\nTools content\n",
-        encoding="utf-8",
-    )
-
     (colls_dir / "col_ai.md").write_text(
         "---\ncollection_id: 'id_ai'\nname: 'col_ai'\n---\n"
         "## 收藏笔记\n- [[ai_only|AI Only]]\n- [[shared_note|Shared Note]]\n",
@@ -350,47 +367,43 @@ def test_multi_collection_duplicate_note_semantics(tmp_path: Path):
     )
     (colls_dir / "col_tools.md").write_text(
         "---\ncollection_id: 'id_tools'\nname: 'col_tools'\n---\n"
-        "## 收藏笔记\n- [[shared_note|Shared Note]]\n- [[tools_only|Tools Only]]\n",
+        "## 收藏笔记\n- [[shared_note|Shared Note]]\n",
         encoding="utf-8",
     )
 
     retriever = VaultRetriever(vault_dir=vault, allow_unisolated_vault=True)
 
-    # Case 1: Priority col_ai first
-    req1 = DigestRequest(
-        digest_name="digest_ai_tools",
-        target_date="2026-09-17",
-        source=SourceConfig(collections=["col_ai", "col_tools"]),
-    )
-    notes1 = retriever.retrieve(req1)
-    assert len(notes1) == 3
-    assert [n.note_id for n in notes1] == ["ai_only", "shared_note", "tools_only"]
+    # 1. Multi-collection request strictly rejected by guard
+    with pytest.raises(ValueError, match="exactly one collection"):
+        DigestRequest(
+            digest_name="digest_multi",
+            target_date="2026-09-17",
+            source=SourceConfig(collections=["col_ai", "col_tools"]),
+        )
 
-    shared_in_req1 = notes1[1]
-    assert shared_in_req1.note_id == "shared_note"
-    assert shared_in_req1.primary_collection == "col_ai"
-    assert shared_in_req1.vault_collection_position == 2
-    # Verify memberships contain BOTH collections
-    assert len(shared_in_req1.memberships) == 2
-    assert shared_in_req1.memberships[0].collection_name == "col_ai"
-    assert shared_in_req1.memberships[0].vault_collection_position == 2
-    assert shared_in_req1.memberships[1].collection_name == "col_tools"
-    assert shared_in_req1.memberships[1].vault_collection_position == 1
-
-    # Case 2: Priority col_tools first
-    req2 = DigestRequest(
-        digest_name="digest_tools_ai",
+    # 2. Querying col_ai alone yields shared_note at position 2
+    req_ai = DigestRequest(
+        digest_name="digest_ai",
         target_date="2026-09-17",
-        source=SourceConfig(collections=["col_tools", "col_ai"]),
+        source=SourceConfig(collections=["col_ai"]),
     )
-    notes2 = retriever.retrieve(req2)
-    assert len(notes2) == 3
-    # With col_tools prioritized, shared_note (col_tools pos 1) comes before tools_only (pos 2) and ai_only (col_ai)
-    assert [n.note_id for n in notes2] == ["shared_note", "tools_only", "ai_only"]
-    shared_in_req2 = notes2[0]
-    assert shared_in_req2.primary_collection == "col_tools"
-    assert shared_in_req2.vault_collection_position == 1
-    assert len(shared_in_req2.memberships) == 2
+    notes_ai = retriever.retrieve(req_ai)
+    assert len(notes_ai) == 2
+    assert notes_ai[1].note_id == "shared_note"
+    assert notes_ai[1].primary_collection == "col_ai"
+    assert notes_ai[1].vault_collection_position == 2
+
+    # 3. Querying col_tools alone yields shared_note at position 1
+    req_tools = DigestRequest(
+        digest_name="digest_tools",
+        target_date="2026-09-17",
+        source=SourceConfig(collections=["col_tools"]),
+    )
+    notes_tools = retriever.retrieve(req_tools)
+    assert len(notes_tools) == 1
+    assert notes_tools[0].note_id == "shared_note"
+    assert notes_tools[0].primary_collection == "col_tools"
+    assert notes_tools[0].vault_collection_position == 1
 
 
 def test_hash_and_order_stability(test_vault: Path):
