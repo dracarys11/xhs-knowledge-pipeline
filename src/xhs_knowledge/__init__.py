@@ -24,6 +24,7 @@ from .contracts import (
 from .extractor import EvidenceExtractor
 from .retriever import VaultRetriever
 from .validator import ProvenanceValidator, ValidationError, ValidationResult
+from .writer import DigestWriter, DigestWriterResult
 
 __all__ = [
     "CollectionIndexer",
@@ -34,6 +35,8 @@ __all__ = [
     "ProvenanceValidator",
     "ValidationResult",
     "ValidationError",
+    "DigestWriter",
+    "DigestWriterResult",
     "DigestRequest",
     "SourceConfig",
     "SelectionConfig",
