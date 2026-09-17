@@ -218,3 +218,35 @@ def test_cli_main(indexer_env, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "=== Obsidian Collection Indexer Summary ===" in captured.out
     assert "Collections Indexed:      1" in captured.out
+
+
+def test_demo_synthetic_fixture_reproducible(tmp_path):
+    """Verifies that the public demo fixtures under demo/ execute deterministically."""
+    demo_dir = Path("demo")
+    if not (demo_dir / "evidence" / "collections").exists():
+        pytest.skip("demo fixtures not found")
+
+    target_vault = tmp_path / "DemoVault"
+    # Copy existing notes to test full link resolution
+    notes_src = demo_dir / "Vault" / "notes"
+    if notes_src.exists():
+        import shutil
+        shutil.copytree(notes_src, target_vault / "notes")
+
+    indexer = CollectionIndexer(
+        vault_dir=target_vault,
+        evidence_dir=demo_dir / "evidence" / "collections",
+        data_dir=demo_dir / "data",
+    )
+    result = indexer.index()
+
+    assert result.collections_indexed == 2
+    assert result.total_notes_referenced == 5
+    assert (target_vault / "README.md").exists()
+    assert (target_vault / "collections" / "AI Tools.md").exists()
+    assert (target_vault / "collections" / "Restaurants.md").exists()
+
+    ai_tools_content = (target_vault / "collections" / "AI Tools.md").read_text(encoding="utf-8")
+    assert "[[demo_note_001|Building Agent Systems]]" in ai_tools_content
+    assert "[[demo_note_002|Reliable LLM Evaluation]]" in ai_tools_content
+

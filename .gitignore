@@ -51,3 +51,7 @@ runs/
 # Local personal knowledge instances (never commit real account exports/evidence)
 Vault/
 knowledge/
+
+# Synthetic, version-controlled demo output (the only Vault committed to Git).
+!demo/Vault/
+!demo/Vault/**

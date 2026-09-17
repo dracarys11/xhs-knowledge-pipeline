@@ -20,11 +20,10 @@ Run the offline collection-index demo:
 PYTHONPATH=src python -m xhs_knowledge \
   --evidence-dir demo/evidence/collections \
   --data-dir demo/data \
-  --vault-dir /tmp/xhs-demo-vault
+  --vault-dir demo/Vault
 ```
 
-The command demonstrates offline collection-index generation. The combined
-post-export shape is illustrated under `demo/expected_vault/`; its synthetic
-notes represent the prior P2.1 projection step. The fixture contains no real
-account identifiers, cookies, session material, signed URLs, or token-bearing
-URLs.
+The command refreshes the synthetic collection indexes in `demo/Vault/`. Its
+five synthetic notes represent the prior P2.1 projection step. The fixture
+contains no real account identifiers, cookies, session material, signed URLs,
+or token-bearing URLs.

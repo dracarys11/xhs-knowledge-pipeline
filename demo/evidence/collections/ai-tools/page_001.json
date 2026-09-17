@@ -1,0 +1,7 @@
+{
+  "notes": [
+    {"note_id": "demo_note_001", "title": "Building Agent Systems", "type": "normal"},
+    {"note_id": "demo_note_002", "title": "Reliable LLM Evaluation", "type": "normal"},
+    {"note_id": "demo_note_003", "title": "Retrieval Design Notes", "type": "normal"}
+  ]
+}

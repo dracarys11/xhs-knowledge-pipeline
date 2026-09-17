@@ -1,0 +1,6 @@
+{
+  "board_id": "demo_restaurants",
+  "name": "Restaurants",
+  "reported_total": 2,
+  "completion_proof": {"type": "SYNTHETIC_DEMO_FIXTURE"}
+}
