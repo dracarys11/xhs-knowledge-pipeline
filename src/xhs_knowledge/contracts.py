@@ -1,6 +1,6 @@
 """Phase C Contracts: Schemas, Data Models, and Exceptions for Offline Knowledge Synthesis.
 
-Ref: docs/PHASE_C_DIGEST_CONTRACT_V1.md
+Ref: docs/PHASE_C_CLAIM_BOUNDARY_V2.md and docs/PHASE_C_DIGEST_CONTRACT_V1.md
 """
 
 from __future__ import annotations
@@ -38,13 +38,33 @@ class InvalidNoteContentError(DigestError):
     pass
 
 
-class EvidenceInvalidNoteIdError(DigestError):
-    """Raised when a claim cites a note_id not present in the input bundle."""
+class EmptyEvidenceError(DigestError):
+    """Raised when a claim contains zero evidence references."""
     pass
 
 
-class EvidenceUnverifiableQuoteError(DigestError):
-    """Raised when a cited quote does not appear verbatim in the note content."""
+class EvidenceNoteNotInBundleError(DigestError):
+    """Raised when a claim cites a note_id not present in the active EvidenceBundle."""
+    pass
+
+
+class SourceHashMismatchError(DigestError):
+    """Raised when the cited source file SHA256 does not match the bundle note's SHA256."""
+    pass
+
+
+class SpanOutOfBoundsError(DigestError):
+    """Raised when evidence quote span offsets fall outside note content_text bounds."""
+    pass
+
+
+class QuoteSpanMismatchError(DigestError):
+    """Raised when the verbatim_quote does not exactly match content_text[quote_start:quote_end]."""
+    pass
+
+
+class CrossNoteSynthesisError(DigestError):
+    """Raised when a claim in v0.1 attempts to aggregate evidence from multiple different notes."""
     pass
 
 
@@ -54,10 +74,16 @@ class ClaimTypeInvalidError(DigestError):
 
 
 class ClaimType(str, Enum):
-    FACT = "FACT"
-    OPINION = "OPINION"
-    RECOMMENDATION = "RECOMMENDATION"
-    SUMMARY = "SUMMARY"
+    FACT = "FACT"  # Source-reported factual assertion; not externally verified
+    OPINION = "OPINION"  # Source author's personal sentiment, taste, or assessment
+    RECOMMENDATION = "RECOMMENDATION"  # Source author's suggested action, tool, or avoidance
+    SUMMARY = "SUMMARY"  # Bounded aggregation of constituent excerpts within a single note
+
+
+class HumanReviewState(str, Enum):
+    DRAFT = "DRAFT"  # Default automated state; pending human review
+    REVIEWED = "REVIEWED"  # Formally audited and approved by human reviewer
+    PUBLISHED = "PUBLISHED"  # Released for downstream knowledge consumption
 
 
 @dataclass
@@ -208,8 +234,38 @@ class EvidenceBundle:
 
 @dataclass
 class EvidenceReference:
+    """Exact, verifiable character span binding to a specific source note."""
     note_id: str
+    source_file_sha256: str
+    quote_start: int
+    quote_end: int
     verbatim_quote: str
+
+    def __post_init__(self) -> None:
+        if not self.note_id:
+            raise ValueError("note_id cannot be empty")
+        if not self.source_file_sha256:
+            raise ValueError("source_file_sha256 cannot be empty")
+        if self.quote_start < 0:
+            raise ValueError(f"quote_start must be non-negative, got {self.quote_start}")
+        if self.quote_end <= self.quote_start:
+            raise ValueError(f"quote_end ({self.quote_end}) must be greater than quote_start ({self.quote_start})")
+        if not self.verbatim_quote:
+            raise ValueError("verbatim_quote cannot be empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EvidenceExcerpt:
+    """Non-interpretive raw excerpt produced by automated EvidenceExtractor."""
+    note_id: str
+    source_file_sha256: str
+    quote_start: int
+    quote_end: int
+    verbatim_quote: str
+    location_hint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -217,27 +273,41 @@ class EvidenceReference:
 
 @dataclass
 class DigestClaim:
+    """Interpretive synthesis assertion. Starts as DRAFT pending human review.
+
+    In v0.1, cross-note synthesis is strictly prohibited. Every claim is bound to a single note_id.
+    """
     claim_id: str
+    note_id: str
     claim_type: ClaimType
-    topic: str
-    summary: str
+    statement: str
     evidence: list[EvidenceReference]
+    topic: str = ""
+    review_state: HumanReviewState = HumanReviewState.DRAFT
+
+    def __post_init__(self) -> None:
+        if not self.claim_id:
+            raise ValueError("claim_id cannot be empty")
+        if not self.note_id:
+            raise ValueError("note_id cannot be empty")
+        if not self.statement or not self.statement.strip():
+            raise ValueError("statement cannot be empty")
+        if not self.evidence:
+            raise EmptyEvidenceError(f"Claim {self.claim_id} has empty evidence list")
+        # Enforce v0.1 single-note boundary
+        for ref in self.evidence:
+            if ref.note_id != self.note_id:
+                raise CrossNoteSynthesisError(
+                    f"Claim {self.claim_id} cites foreign note {ref.note_id}; cross-note synthesis is forbidden in v0.1."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "claim_id": self.claim_id,
+            "note_id": self.note_id,
             "claim_type": self.claim_type.value if isinstance(self.claim_type, ClaimType) else str(self.claim_type),
+            "statement": self.statement,
             "topic": self.topic,
-            "summary": self.summary,
+            "review_state": self.review_state.value if isinstance(self.review_state, HumanReviewState) else str(self.review_state),
             "evidence": [e.to_dict() for e in self.evidence],
         }
-
-
-@dataclass
-class EvidenceExcerpt:
-    note_id: str
-    text: str
-    location: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
