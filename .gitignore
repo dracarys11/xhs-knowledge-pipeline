@@ -47,3 +47,7 @@ htmlcov/
 # Sync state database
 .xhs-state/
 runs/
+
+# Local personal knowledge instances (never commit real account exports/evidence)
+Vault/
+knowledge/

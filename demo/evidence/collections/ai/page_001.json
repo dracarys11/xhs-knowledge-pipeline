@@ -1,0 +1,14 @@
+{
+  "notes": [
+    {
+      "note_id": "demo_001",
+      "title": "Example AI Agent Note",
+      "type": "normal"
+    },
+    {
+      "note_id": "demo_002",
+      "title": "Example Knowledge Workflow",
+      "type": "normal"
+    }
+  ]
+}
