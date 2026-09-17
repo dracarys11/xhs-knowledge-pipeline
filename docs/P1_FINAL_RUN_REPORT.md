@@ -1,5 +1,17 @@
 # P1 Final Run Report
 
+## Scope Clarification
+
+This report evaluates the final observed run.
+
+"NOT PASSED" refers only to remote enumeration completion proof.
+
+It does not indicate:
+- database corruption
+- state machine failure
+- artifact failure
+- resume failure
+
 ## Decision
 
 P1 status: **NOT PASSED**
