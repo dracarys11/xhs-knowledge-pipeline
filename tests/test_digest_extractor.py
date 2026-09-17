@@ -1,14 +1,17 @@
 """Unit tests for Phase C.2 EvidenceExtractor (Module 1 - Mechanical Chunking).
 
 Verifies:
-1. Pure mechanical extraction: split("\\n\\n") -> strip -> non-empty -> top N.
-2. Zero length discrimination: short paragraphs (e.g. "很好吃") are not filtered.
-3. Exact substring invariant: verbatim_quote in note.content_text.
-4. Unicode & Emoji preservation: e.g. "✨🍜🍣".
-5. Deterministic reproducibility across runs.
-6. Real VaultRetriever bundle extraction.
+1. Pure mechanical extraction: split("\\n\\n") -> filter empty -> top N raw paragraphs.
+2. Raw paragraph whitespace preservation (verbatim fidelity).
+3. Newline fallback behavior when no double newlines exist.
+4. Input immutability of EvidenceBundle and SelectedNote.
+5. Exact substring invariant: verbatim_quote in note.content_text.
+6. Unicode & Emoji preservation: e.g. "✨🍜🍣".
+7. Deterministic reproducibility across runs.
+8. Real VaultRetriever bundle extraction.
 """
 
+import copy
 from pathlib import Path
 import pytest
 
@@ -53,7 +56,7 @@ def sample_note() -> SelectedNote:
 
 
 def test_extractor_mechanical_chunking_and_substring_invariant(sample_note: SelectedNote):
-    """Extractor extracts paragraphs in mechanical order, keeping short paragraphs without heuristic filtering."""
+    """Extractor extracts paragraphs in mechanical order without heuristic filtering."""
     extractor = EvidenceExtractor(max_excerpts_per_note=3)
     excerpts = extractor.extract_note_excerpts(sample_note)
 
@@ -69,9 +72,88 @@ def test_extractor_mechanical_chunking_and_substring_invariant(sample_note: Sele
     assert excerpts[1].verbatim_quote == "第二段：分布式系统的核心在于在不可靠的网络上构建可靠的状态机。"
     assert excerpts[1].verbatim_quote in sample_note.content_text
 
-    # Paragraph 3: Short paragraph with Emoji NOT filtered out
+    # Paragraph 3: Short paragraph with Emoji preserved
     assert excerpts[2].verbatim_quote == "短文本✨🍜"
     assert excerpts[2].verbatim_quote in sample_note.content_text
+
+
+def test_extractor_whitespace_fidelity():
+    """Verbatim quote must preserve internal and surrounding whitespace of raw paragraphs exactly."""
+    note_with_ws = SelectedNote(
+        note_id="ws_001",
+        title="空白测试",
+        author_name="作者",
+        primary_collection="c",
+        vault_collection_position=1,
+        memberships=[],
+        content_text="  第一段保留前导与后置空格  \n\n\t第二段带Tab缩进\t\n\n   \n\n第三段",
+        file_path="notes/ws.md",
+        file_sha256="sha_ws_123",
+    )
+    extractor = EvidenceExtractor(max_excerpts_per_note=3)
+    excerpts = extractor.extract_note_excerpts(note_with_ws)
+
+    assert len(excerpts) == 3
+    # Exactly verbatim raw paragraph strings:
+    assert excerpts[0].verbatim_quote == "  第一段保留前导与后置空格  "
+    assert excerpts[1].verbatim_quote == "\t第二段带Tab缩进\t"
+    # Third non-empty paragraph (empty whitespace block skipped)
+    assert excerpts[2].verbatim_quote == "第三段"
+
+    for e in excerpts:
+        assert e.verbatim_quote in note_with_ws.content_text
+
+
+def test_extractor_newline_fallback():
+    """When no double newlines exist, falls back to splitting by single newline."""
+    single_nl_note = SelectedNote(
+        note_id="nl_001",
+        title="单换行笔记",
+        author_name="作者",
+        primary_collection="c",
+        vault_collection_position=1,
+        memberships=[],
+        content_text="第一行内容\n第二行内容\n\n第三行内容",  # Has \n\n so splits by \n\n
+        file_path="notes/nl.md",
+        file_sha256="sha_nl_123",
+    )
+    pure_single_nl_note = SelectedNote(
+        note_id="pure_nl_001",
+        title="纯单换行笔记",
+        author_name="作者",
+        primary_collection="c",
+        vault_collection_position=1,
+        memberships=[],
+        content_text="第一行内容\n第二行内容\n第三行内容",  # No \n\n, pure single \n
+        file_path="notes/pure_nl.md",
+        file_sha256="sha_pnl_123",
+    )
+
+    extractor = EvidenceExtractor(max_excerpts_per_note=3)
+    excerpts = extractor.extract_note_excerpts(pure_single_nl_note)
+    assert len(excerpts) == 3
+    assert excerpts[0].verbatim_quote == "第一行内容"
+    assert excerpts[1].verbatim_quote == "第二行内容"
+    assert excerpts[2].verbatim_quote == "第三行内容"
+
+
+def test_extractor_input_immutability(sample_note: SelectedNote):
+    """Calling extract must not mutate EvidenceBundle or its SelectedNotes in place."""
+    bundle = EvidenceBundle(
+        bundle_id="bundle_immut_01",
+        request_fingerprint="fp_immut_01",
+        created_at="2026-09-18T00:00:00Z",
+        total_notes=1,
+        notes=[sample_note],
+    )
+
+    before_dict = copy.deepcopy(bundle.to_dict())
+    extractor = EvidenceExtractor(max_excerpts_per_note=3)
+    excerpts = extractor.extract(bundle)
+    assert len(excerpts) > 0
+
+    after_dict = bundle.to_dict()
+    assert before_dict == after_dict, "EvidenceBundle or SelectedNote was mutated during extract()!"
 
 
 def test_extractor_unicode_and_emoji_handling():

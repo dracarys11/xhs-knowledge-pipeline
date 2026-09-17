@@ -1,7 +1,7 @@
 """EvidenceExtractor: Mechanical, non-semantic excerpt extractor for Phase C.2 MVP.
 
 Splits content_text strictly by paragraph boundaries, taking the first N non-empty paragraphs.
-Zero NLP, zero semantic ranking, zero min_length filtering.
+Zero NLP, zero semantic ranking, zero heuristic trimming.
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ class EvidenceExtractor:
         """Extracts the first N non-empty paragraphs mechanically from a note.
 
         Algorithm:
-        content_text -> split('\\n\\n') -> strip -> filter non-empty -> take first N -> emit EvidenceExcerpt
+        content_text -> split('\\n\\n') -> filter whitespace-only -> take first N raw paragraphs.
+        strip() is used solely for empty checking; emitted quote is the exact raw paragraph.
         """
         content = note.content_text
         if not content or not content.strip():
@@ -44,18 +45,14 @@ class EvidenceExtractor:
 
         excerpts: list[EvidenceExcerpt] = []
         for raw_para in raw_paragraphs:
-            cleaned = raw_para.strip()
-            if not cleaned:
+            if not raw_para.strip():
                 continue
-
-            # Invariant: cleaned text must exist verbatim in content
-            assert cleaned in content, f"Mechanical chunk mismatch in note {note.note_id}"
 
             excerpts.append(
                 EvidenceExcerpt(
                     note_id=note.note_id,
                     source_file_sha256=note.file_sha256,
-                    verbatim_quote=cleaned,
+                    verbatim_quote=raw_para,
                 )
             )
 
