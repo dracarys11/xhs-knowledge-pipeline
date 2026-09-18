@@ -1,5 +1,23 @@
 # Project Rules
 
+## Harness Bootstrap
+
+Every agent session must load, before substantive work:
+
+1. `.agent/PROJECT_RULES.md`
+2. Its own role contract at `.agent/<ROLE>.md`
+
+Before substantive work, the agent must report:
+
+```text
+Harness loaded:
+- PROJECT_RULES.md
+- <ROLE>.md
+```
+
+If either required file cannot be read, the agent must stop. It must not infer,
+replace, or continue without its role contract.
+
 ## Project Identity
 
 Name: `xhs-knowledge-pipeline`
