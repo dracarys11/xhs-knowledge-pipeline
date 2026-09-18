@@ -178,5 +178,28 @@ Rather than raw test counts, the test suite emphasizes verification across criti
 
 ---
 
+## Agent Workflow
+
+```text
+Gemini
+Architecture review
+
+        ↓
+
+ZCode
+Implementation
+
+        ↓
+
+Codex
+Audit
+
+        ↓
+
+Human approval
+```
+
+---
+
 ## License
 MIT License. Strictly for personal knowledge archival and educational research.
