@@ -6,10 +6,14 @@ Writes:
 
 Enforces:
 - Physical boundary containment strictly within Vault/digests/ (symlink escape prevention).
-- Atomic writing via temporary files (.tmp) and POSIX atomic replacement.
-- Unknown file overwrite protection: refuses to overwrite files that lack digest signatures.
-- Fail-closed semantics: 0 validated excerpts -> 0 bytes markdown written (file omitted),
-  manifest written with artifact_status: "INCOMPLETE" and verified_excerpts_count: 0.
+- Two-phase prepare-and-publish with atomic rollback: failure during publication cannot
+  leave a mismatched valid artifact pair.
+- Unknown file overwrite protection: refuses to overwrite or delete files that lack digest signatures.
+- Stale Markdown cleanup: on zero-valid rerun, removes existing managed Markdown file and publishes
+  only an INCOMPLETE manifest.
+- Verbatim evidence preservation: persists exact un-stripped, un-normalized verbatim_quote in manifest.
+- ValidationResult trust boundary: validates counts and re-verifies structural provenance of all
+  validated excerpts against EvidenceBundle before publishing.
 - Zero NLP, zero summarization, zero rewriting, zero editorial commentary.
 """
 
@@ -31,7 +35,7 @@ from xhs_knowledge.contracts import (
     EvidenceBundle,
     EvidenceExcerpt,
 )
-from xhs_knowledge.validator import ValidationResult
+from xhs_knowledge.validator import ProvenanceValidator, ValidationResult
 
 
 @dataclass
@@ -133,37 +137,53 @@ class DigestWriter:
             return False
         return False
 
-    def _atomic_write_text(self, target_path: Path, content: str, overwrite: bool = True) -> str:
-        """Atomically writes UTF-8 text to target_path via a temp file. Returns SHA256."""
-        self._require_inside_digests(target_path)
+    def _assert_validation_trust_boundary(
+        self, validation_result: ValidationResult, bundle: EvidenceBundle
+    ) -> None:
+        """Enforces trust boundary on ValidationResult before publishing.
 
-        if target_path.exists():
-            if not overwrite:
-                raise FileExistsError(f"Target file '{target_path.name}' already exists and overwrite=False.")
-            if not self._is_known_digest_artifact(target_path):
-                raise BoundaryViolationError(
-                    f"Refusing to overwrite unknown/non-digest file at '{target_path}'."
+        Checks:
+        1. Correct type and internal count consistency.
+        2. Status and count invariant: PASS requires validated_count > 0 and failed_count == 0.
+        3. Structural provenance re-verification of every validated excerpt against EvidenceBundle.
+        """
+        if not isinstance(validation_result, ValidationResult):
+            raise ValueError(
+                f"validation_result must be a ValidationResult instance, got {type(validation_result).__name__}."
+            )
+
+        if validation_result.validated_count != len(validation_result.validated_excerpts):
+            raise ValueError(
+                f"ValidationResult internal inconsistency: validated_count ({validation_result.validated_count}) "
+                f"!= len(validated_excerpts) ({len(validation_result.validated_excerpts)})."
+            )
+
+        if validation_result.failed_count != len(validation_result.omitted_excerpts):
+            raise ValueError(
+                f"ValidationResult internal inconsistency: failed_count ({validation_result.failed_count}) "
+                f"!= len(omitted_excerpts) ({len(validation_result.omitted_excerpts)})."
+            )
+
+        if validation_result.status == "PASS" and (
+            validation_result.failed_count > 0 or validation_result.validated_count == 0
+        ):
+            raise ValueError(
+                f"ValidationResult invalid status invariant: status is PASS but validated_count="
+                f"{validation_result.validated_count}, failed_count={validation_result.failed_count}."
+            )
+
+        # Structural provenance re-verification against bundle
+        validator = ProvenanceValidator()
+        for exc in validation_result.validated_excerpts:
+            ok, err = validator.validate_excerpt(exc, bundle)
+            if not ok:
+                err_code = err.code if err else "PROVENANCE_RECHECK_FAILED"
+                err_msg = err.message if err else "Provenance re-check failed"
+                note_id = getattr(exc, "note_id", "unknown")
+                raise ValueError(
+                    f"ValidationResult trust boundary violation: excerpt for note '{note_id}' "
+                    f"failed structural provenance re-verification ({err_code}: {err_msg})."
                 )
-
-        self.digests_dir.mkdir(parents=True, exist_ok=True)
-
-        tmp_path = self.digests_dir / f".tmp_{target_path.name}_{os.getpid()}_{uuid.uuid4().hex}"
-        try:
-            data = content.encode("utf-8")
-            content_sha256 = hashlib.sha256(data).hexdigest()
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(tmp_path, target_path)
-            return content_sha256
-        finally:
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
 
     def format_markdown(
         self,
@@ -254,6 +274,16 @@ class DigestWriter:
             for n in bundle.notes
         ]
 
+        # Preserve verbatim_quote with 100% fidelity in manifest
+        verified_excerpts = [
+            {
+                "note_id": exc.note_id,
+                "source_file_sha256": exc.source_file_sha256,
+                "verbatim_quote": exc.verbatim_quote,
+            }
+            for exc in validation_result.validated_excerpts
+        ]
+
         total_candidates = validation_result.validated_count + validation_result.failed_count
 
         manifest = {
@@ -269,6 +299,7 @@ class DigestWriter:
             "candidate_excerpts_count": total_candidates,
             "verified_excerpts_count": validation_result.validated_count,
             "omitted_excerpts_count": validation_result.failed_count,
+            "verified_excerpts": verified_excerpts,
             "output_file": markdown_rel_path,
             "output_sha256": markdown_sha256,
             "artifact_status": artifact_status,
@@ -287,12 +318,15 @@ class DigestWriter:
     ) -> DigestWriterResult:
         """Serializes the digest and manifest according to validated provenance.
 
-        Fail-closed:
-        - If validated_count == 0: writes zero bytes to .md (omitted), writes INCOMPLETE manifest.
-        - If validated_count > 0 and is_valid: writes COMPLETE markdown and manifest.
-        - If validated_count > 0 and not is_valid: writes INCOMPLETE markdown and manifest.
+        Fail-closed guarantees:
+        - ValidationResult trust boundary re-checks all validated excerpts.
+        - Zero validated excerpts: removes any stale same-name Markdown file and publishes
+          only an INCOMPLETE manifest.
+        - Two-phase prepare-and-publish: failures during commit roll back cleanly,
+          preventing mismatched artifact pairs.
+        - Preserves unknown-file protection on both .md and .manifest.json targets.
         """
-        # Validate request parameters for boundary safety
+        # 1. Parameter format & boundary validation
         self._validate_safe_name(request.digest_name, "digest_name")
         self._validate_safe_name(request.target_date, "target_date")
 
@@ -309,6 +343,9 @@ class DigestWriter:
                 f"DigestRequest must contain exactly 1 collection, got {len(request.source.collections)}."
             )
 
+        # 2. Enforce trust boundary on ValidationResult
+        self._assert_validation_trust_boundary(validation_result, bundle)
+
         if generated_at is None:
             generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -318,9 +355,32 @@ class DigestWriter:
         markdown_path = self.digests_dir / markdown_filename
         manifest_path = self.digests_dir / manifest_filename
 
-        # Fail closed on zero validated excerpts
+        self._require_inside_digests(markdown_path)
+        self._require_inside_digests(manifest_path)
+        self.digests_dir.mkdir(parents=True, exist_ok=True)
+
+        # =====================================================================
+        # CASE 1: Zero Validated Excerpts (Fail-Closed, Remove Stale Markdown)
+        # =====================================================================
         if validation_result.validated_count == 0:
             artifact_status = "INCOMPLETE"
+
+            # Check unknown file protection before modifying anything
+            if markdown_path.exists():
+                if not overwrite:
+                    raise FileExistsError(f"Target file '{markdown_path.name}' already exists and overwrite=False.")
+                if not self._is_known_digest_artifact(markdown_path):
+                    raise BoundaryViolationError(
+                        f"Refusing to remove unknown/non-digest file at '{markdown_path}'."
+                    )
+            if manifest_path.exists():
+                if not overwrite:
+                    raise FileExistsError(f"Target file '{manifest_path.name}' already exists and overwrite=False.")
+                if not self._is_known_digest_artifact(manifest_path):
+                    raise BoundaryViolationError(
+                        f"Refusing to overwrite unknown/non-digest file at '{manifest_path}'."
+                    )
+
             manifest_data = self.format_manifest(
                 request=request,
                 bundle=bundle,
@@ -331,7 +391,58 @@ class DigestWriter:
                 artifact_status=artifact_status,
             )
             manifest_json = json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-            manifest_sha256 = self._atomic_write_text(manifest_path, manifest_json, overwrite=overwrite)
+            manifest_bytes = manifest_json.encode("utf-8")
+            manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+
+            # Staging temp file for manifest
+            tmp_manifest = self.digests_dir / f".tmp_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}"
+            backup_md = self.digests_dir / f".bak_{markdown_filename}_{os.getpid()}_{uuid.uuid4().hex}" if markdown_path.exists() else None
+            backup_manifest = self.digests_dir / f".bak_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}" if manifest_path.exists() else None
+
+            try:
+                with open(tmp_manifest, "wb") as f:
+                    f.write(manifest_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Transactional commit: move existing files to backup
+                if backup_md:
+                    os.replace(markdown_path, backup_md)
+                if backup_manifest:
+                    os.replace(manifest_path, backup_manifest)
+
+                # Publish manifest
+                os.replace(tmp_manifest, manifest_path)
+
+                # Clean up backups (stale markdown is safely removed!)
+                if backup_md and backup_md.exists():
+                    backup_md.unlink()
+                if backup_manifest and backup_manifest.exists():
+                    backup_manifest.unlink()
+
+            except Exception:
+                # Rollback on failure
+                if backup_md and backup_md.exists():
+                    os.replace(backup_md, markdown_path)
+                if backup_manifest and backup_manifest.exists():
+                    os.replace(backup_manifest, manifest_path)
+                raise
+            finally:
+                if tmp_manifest.exists():
+                    try:
+                        tmp_manifest.unlink()
+                    except OSError:
+                        pass
+                if backup_md and backup_md.exists():
+                    try:
+                        backup_md.unlink()
+                    except OSError:
+                        pass
+                if backup_manifest and backup_manifest.exists():
+                    try:
+                        backup_manifest.unlink()
+                    except OSError:
+                        pass
 
             return DigestWriterResult(
                 markdown_path=None,
@@ -344,8 +455,22 @@ class DigestWriter:
                 omitted_excerpts_count=validation_result.failed_count,
             )
 
+        # =====================================================================
+        # CASE 2: Validated Excerpts > 0 (Two-Phase Prepare-and-Publish)
+        # =====================================================================
         artifact_status = "COMPLETE" if validation_result.is_valid else "INCOMPLETE"
 
+        # Check unknown file protection before preparing or modifying
+        for target in (markdown_path, manifest_path):
+            if target.exists():
+                if not overwrite:
+                    raise FileExistsError(f"Target file '{target.name}' already exists and overwrite=False.")
+                if not self._is_known_digest_artifact(target):
+                    raise BoundaryViolationError(
+                        f"Refusing to overwrite unknown/non-digest file at '{target}'."
+                    )
+
+        # Phase 1: Prepare contents & checksums
         markdown_content = self.format_markdown(
             request=request,
             bundle=bundle,
@@ -353,7 +478,8 @@ class DigestWriter:
             generated_at=generated_at,
             artifact_status=artifact_status,
         )
-        markdown_sha256 = self._atomic_write_text(markdown_path, markdown_content, overwrite=overwrite)
+        markdown_bytes = markdown_content.encode("utf-8")
+        markdown_sha256 = hashlib.sha256(markdown_bytes).hexdigest()
 
         manifest_data = self.format_manifest(
             request=request,
@@ -365,7 +491,77 @@ class DigestWriter:
             artifact_status=artifact_status,
         )
         manifest_json = json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        manifest_sha256 = self._atomic_write_text(manifest_path, manifest_json, overwrite=overwrite)
+        manifest_bytes = manifest_json.encode("utf-8")
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+
+        # Write both to temp staging files
+        tmp_md = self.digests_dir / f".tmp_{markdown_filename}_{os.getpid()}_{uuid.uuid4().hex}"
+        tmp_manifest = self.digests_dir / f".tmp_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}"
+        backup_md = self.digests_dir / f".bak_{markdown_filename}_{os.getpid()}_{uuid.uuid4().hex}" if markdown_path.exists() else None
+        backup_manifest = self.digests_dir / f".bak_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}" if manifest_path.exists() else None
+
+        md_committed = False
+        manifest_committed = False
+
+        try:
+            with open(tmp_md, "wb") as f_md:
+                f_md.write(markdown_bytes)
+                f_md.flush()
+                os.fsync(f_md.fileno())
+
+            with open(tmp_manifest, "wb") as f_mf:
+                f_mf.write(manifest_bytes)
+                f_mf.flush()
+                os.fsync(f_mf.fileno())
+
+            # Phase 2: Atomic Publication with Rollback
+            # Backup existing
+            if backup_md:
+                os.replace(markdown_path, backup_md)
+            if backup_manifest:
+                os.replace(manifest_path, backup_manifest)
+
+            # Publish markdown
+            os.replace(tmp_md, markdown_path)
+            md_committed = True
+
+            # Publish manifest
+            os.replace(tmp_manifest, manifest_path)
+            manifest_committed = True
+
+            # Publication complete: remove backups
+            if backup_md and backup_md.exists():
+                backup_md.unlink()
+            if backup_manifest and backup_manifest.exists():
+                backup_manifest.unlink()
+
+        except Exception:
+            # Transaction Rollback: restore previous state or remove orphaned published file
+            if md_committed:
+                if backup_md and backup_md.exists():
+                    os.replace(backup_md, markdown_path)
+                elif markdown_path.exists():
+                    markdown_path.unlink()
+            elif backup_md and backup_md.exists():
+                os.replace(backup_md, markdown_path)
+
+            if manifest_committed:
+                if backup_manifest and backup_manifest.exists():
+                    os.replace(backup_manifest, manifest_path)
+                elif manifest_path.exists():
+                    manifest_path.unlink()
+            elif backup_manifest and backup_manifest.exists():
+                os.replace(backup_manifest, manifest_path)
+
+            raise
+        finally:
+            # Clean up temp and backup files
+            for p in (tmp_md, tmp_manifest, backup_md, backup_manifest):
+                if p and p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
 
         return DigestWriterResult(
             markdown_path=markdown_path,

@@ -9,9 +9,16 @@ Verifies:
 6. Unknown file protection: refuses to overwrite files that do not have digest artifact signatures.
 7. Atomic deterministic reproducibility: identical inputs produce bit-for-bit identical artifacts and hashes.
 8. Multiline quote formatting: preserves verbatim fidelity and blockquote indentations.
+9. Stale Markdown cleanup on zero-valid rerun: safely removes previous same-name .md artifact.
+10. Paired artifact consistency and rollback: simulated publication failure leaves no mismatched artifacts.
+11. Verbatim quote preservation in manifest: raw multiline quote with whitespace/emojis preserved 100% untouched.
+12. ValidationResult trust boundary: rejects forged or count-inconsistent ValidationResult instances.
+13. Hash identity re-read from disk: disk content SHA256 matches returned and manifest hashes.
 """
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import pytest
 
@@ -168,6 +175,10 @@ def test_successful_digest_write_complete(
     assert manifest_dict["inputs"][0]["note_id"] == "6aa62ab4000000001001fc4f"
     assert len(manifest_dict["errors"]) == 0
 
+    # Verify verbatim_excerpts stored in manifest
+    assert len(manifest_dict["verified_excerpts"]) == 3
+    assert manifest_dict["verified_excerpts"][0]["verbatim_quote"] == "一个月 20 刀的 Antigravity CLI，可能被很多人低估了。"
+
 
 def test_fail_closed_on_zero_validated_excerpts(
     tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
@@ -209,6 +220,7 @@ def test_fail_closed_on_zero_validated_excerpts(
     assert manifest_dict["output_sha256"] == ""
     assert len(manifest_dict["errors"]) == 1
     assert manifest_dict["errors"][0]["code"] == "EMPTY_EVIDENCE"
+    assert manifest_dict["verified_excerpts"] == []
 
 
 def test_partial_validation_writes_incomplete_artifact(
@@ -405,18 +417,37 @@ def test_atomic_deterministic_reproducibility(
 
 
 def test_multiline_verbatim_quote_formatting(
-    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+    tmp_path: Path, sample_request: DigestRequest
 ):
-    """Multiline verbatim quotes are formatted cleanly with blockquote indentation."""
+    """Multiline verbatim quotes are formatted cleanly with blockquote indentation in markdown."""
     writer = DigestWriter(vault_dir=tmp_path)
 
     multiline_quote = "第一行内容。\n第二行说明。\n第三行总结。"
+    custom_note = SelectedNote(
+        note_id="6aa62ab4000000001001fc4f",
+        title="测试多行笔记",
+        author_name="艾康",
+        primary_collection="coding",
+        vault_collection_position=1,
+        memberships=[],
+        content_text="引言部分。\n\n第一行内容。\n第二行说明。\n第三行总结。\n\n结尾部分。",
+        file_path="notes/custom.md",
+        file_sha256="sha256_custom_hash",
+    )
+    bundle = EvidenceBundle(
+        bundle_id="bundle_custom",
+        request_fingerprint="req_custom",
+        created_at="2026-09-18T00:00:00Z",
+        total_notes=1,
+        notes=[custom_note],
+    )
+
     val_result = ValidationResult(
         status="PASS",
         validated_excerpts=[
             EvidenceExcerpt(
                 note_id="6aa62ab4000000001001fc4f",
-                source_file_sha256="sha256_note1_hash",
+                source_file_sha256="sha256_custom_hash",
                 verbatim_quote=multiline_quote,
             )
         ],
@@ -426,7 +457,263 @@ def test_multiline_verbatim_quote_formatting(
         errors=[],
     )
 
-    res = writer.write(sample_request, sample_bundle, val_result, generated_at="2026-09-18T00:10:00Z")
+    res = writer.write(sample_request, bundle, val_result, generated_at="2026-09-18T00:10:00Z")
     md = res.markdown_path.read_text(encoding="utf-8")
 
     assert '- > "第一行内容。\n  > 第二行说明。\n  > 第三行总结。"' in md
+
+
+# =============================================================================
+# P0 REMEDIATION TESTS
+# =============================================================================
+
+def test_successful_artifact_followed_by_zero_valid_rerun_removes_stale_markdown(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+):
+    """P0-1: A zero-valid rerun must safely remove any existing same-name Markdown artifact."""
+    writer = DigestWriter(vault_dir=tmp_path)
+
+    # 1. First run succeeds
+    valid_exc = EvidenceExcerpt(
+        note_id="6aa62ab4000000001001fc4f",
+        source_file_sha256="sha256_note1_hash",
+        verbatim_quote="一个月 20 刀的 Antigravity CLI，可能被很多人低估了。",
+    )
+    val_pass = ValidationResult(
+        status="PASS",
+        validated_excerpts=[valid_exc],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+    res1 = writer.write(sample_request, sample_bundle, val_pass, generated_at="2026-09-18T00:10:00Z")
+    assert res1.markdown_path.exists()
+    assert res1.manifest_path.exists()
+
+    md_file_path = res1.markdown_path
+
+    # 2. Second run for same digest with validated_count == 0
+    val_zero = ValidationResult(
+        status="FAILED",
+        validated_excerpts=[],
+        omitted_excerpts=[],
+        validated_count=0,
+        failed_count=0,
+        errors=[ValidationError(code="EMPTY_EVIDENCE", note_id="", message="Zero evidence.")],
+    )
+    res2 = writer.write(sample_request, sample_bundle, val_zero, generated_at="2026-09-18T00:20:00Z")
+
+    assert res2.artifact_status == "INCOMPLETE"
+    assert res2.markdown_path is None
+
+    # CRITICAL P0 ASSERTION: Previous markdown must be completely gone!
+    assert not md_file_path.exists(), "Stale markdown file must be deleted upon zero-valid rerun!"
+
+    # Manifest must be updated to INCOMPLETE
+    manifest = json.loads(res2.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["artifact_status"] == "INCOMPLETE"
+    assert manifest["verified_excerpts_count"] == 0
+    assert manifest["output_file"] == ""
+
+
+def test_simulated_publication_failure_cannot_leave_mismatched_valid_artifact_pair(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle, monkeypatch
+):
+    """P0-2: Failure during publication must roll back cleanly without leaving an orphaned new Markdown."""
+    writer = DigestWriter(vault_dir=tmp_path)
+
+    val_result = ValidationResult(
+        status="PASS",
+        validated_excerpts=[
+            EvidenceExcerpt(
+                note_id="6aa62ab4000000001001fc4f",
+                source_file_sha256="sha256_note1_hash",
+                verbatim_quote="一个月 20 刀的 Antigravity CLI，可能被很多人低估了。",
+            )
+        ],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+
+    md_target = tmp_path / "digests" / "2026-09-17_ai_daily.md"
+    manifest_target = tmp_path / "digests" / "2026-09-17_ai_daily.manifest.json"
+
+    # Simulate failure when publishing the manifest (os.replace on manifest_target fails)
+    orig_replace = os.replace
+
+    def mock_replace(src, dst):
+        if str(dst) == str(manifest_target):
+            raise OSError("Simulated disk error while committing manifest!")
+        return orig_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", mock_replace)
+
+    with pytest.raises(OSError, match="Simulated disk error"):
+        writer.write(sample_request, sample_bundle, val_result)
+
+    # CRITICAL P0 ASSERTION: Rollback must ensure no newly published markdown was left orphaned
+    assert not md_target.exists(), "Rollback must remove orphaned new Markdown when manifest publish fails!"
+    assert not manifest_target.exists(), "Manifest target must not exist!"
+
+
+def test_multiline_raw_verbatim_quote_is_preserved_exactly_in_manifest(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+):
+    """P0-3: Manifest persists exact raw verbatim_quote untouched, even if markdown formats it with >."""
+    writer = DigestWriter(vault_dir=tmp_path)
+
+    # Note 1 content has: "一个月 20 刀的 Antigravity CLI，可能被很多人低估了。\n\n谷歌 Gemini CLI 6月18日停止个人账号支持，推荐Antigravity CLI替代..."
+    # Create an excerpt with exact newline, spaces, and Unicode
+    raw_quote = "一个月 20 刀的 Antigravity CLI，可能被很多人低估了。\n\n谷歌 Gemini CLI 6月18日停止个人账号支持，推荐Antigravity CLI替代..."
+
+    val_result = ValidationResult(
+        status="PASS",
+        validated_excerpts=[
+            EvidenceExcerpt(
+                note_id="6aa62ab4000000001001fc4f",
+                source_file_sha256="sha256_note1_hash",
+                verbatim_quote=raw_quote,
+            )
+        ],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+
+    res = writer.write(sample_request, sample_bundle, val_result, generated_at="2026-09-18T00:10:00Z")
+
+    manifest = json.loads(res.manifest_path.read_text(encoding="utf-8"))
+    saved_quote = manifest["verified_excerpts"][0]["verbatim_quote"]
+
+    # CRITICAL P0 ASSERTION: Byte-for-byte identical, no stripping, no added >
+    assert saved_quote == raw_quote
+    assert "\n\n" in saved_quote
+    assert not saved_quote.startswith(">")
+
+
+def test_inconsistent_forged_validation_result_is_rejected(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+):
+    """P0-4: Structurally inconsistent or forged ValidationResult instances are rejected."""
+    writer = DigestWriter(vault_dir=tmp_path)
+
+    valid_exc = EvidenceExcerpt(
+        note_id="6aa62ab4000000001001fc4f",
+        source_file_sha256="sha256_note1_hash",
+        verbatim_quote="一个月 20 刀的 Antigravity CLI，可能被很多人低估了。",
+    )
+
+    # 1. Count mismatch: validated_count != len(validated_excerpts)
+    inconsistent_val = ValidationResult(
+        status="PASS",
+        validated_excerpts=[valid_exc],
+        omitted_excerpts=[],
+        validated_count=99,  # Forged count
+        failed_count=0,
+        errors=[],
+    )
+    with pytest.raises(ValueError, match="validated_count"):
+        writer.write(sample_request, sample_bundle, inconsistent_val)
+
+    # 2. Failed count mismatch: failed_count != len(omitted_excerpts)
+    inconsistent_failed = ValidationResult(
+        status="FAILED",
+        validated_excerpts=[valid_exc],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=5,  # Forged failed_count
+        errors=[],
+    )
+    with pytest.raises(ValueError, match="failed_count"):
+        writer.write(sample_request, sample_bundle, inconsistent_failed)
+
+    # 3. Forged excerpt quote not in bundle note
+    forged_quote_exc = EvidenceExcerpt(
+        note_id="6aa62ab4000000001001fc4f",
+        source_file_sha256="sha256_note1_hash",
+        verbatim_quote="完全捏造且不存在的虚假文本",
+    )
+    forged_val = ValidationResult(
+        status="PASS",
+        validated_excerpts=[forged_quote_exc],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+    with pytest.raises(ValueError, match="QUOTE_NOT_FOUND"):
+        writer.write(sample_request, sample_bundle, forged_val)
+
+    # 4. Forged source hash mismatch
+    forged_hash_exc = EvidenceExcerpt(
+        note_id="6aa62ab4000000001001fc4f",
+        source_file_sha256="tampered_sha256_value",
+        verbatim_quote="一个月 20 刀的 Antigravity CLI，可能被很多人低估了。",
+    )
+    forged_hash_val = ValidationResult(
+        status="PASS",
+        validated_excerpts=[forged_hash_exc],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+    with pytest.raises(ValueError, match="SOURCE_HASH_MISMATCH"):
+        writer.write(sample_request, sample_bundle, forged_hash_val)
+
+    # 5. Forged foreign note_id
+    foreign_note_exc = EvidenceExcerpt(
+        note_id="foreign_ghost_note",
+        source_file_sha256="sha256_note1_hash",
+        verbatim_quote="一个月 20 刀的 Antigravity CLI，可能被很多人低估了。",
+    )
+    foreign_val = ValidationResult(
+        status="PASS",
+        validated_excerpts=[foreign_note_exc],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+    with pytest.raises(ValueError, match="INVALID_NOTE_REFERENCE"):
+        writer.write(sample_request, sample_bundle, foreign_val)
+
+
+def test_written_output_hashes_equal_hashes_reread_from_disk(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+):
+    """Output hashes equal SHA256 re-read directly from written disk files."""
+    writer = DigestWriter(vault_dir=tmp_path)
+
+    valid_exc = EvidenceExcerpt(
+        note_id="6aa62ab4000000001001fc4f",
+        source_file_sha256="sha256_note1_hash",
+        verbatim_quote="一个月 20 刀的 Antigravity CLI，可能被很多人低估了。",
+    )
+    val_result = ValidationResult(
+        status="PASS",
+        validated_excerpts=[valid_exc],
+        omitted_excerpts=[],
+        validated_count=1,
+        failed_count=0,
+        errors=[],
+    )
+
+    res = writer.write(sample_request, sample_bundle, val_result, generated_at="2026-09-18T00:10:00Z")
+
+    # Re-read raw bytes directly from filesystem
+    disk_md_bytes = res.markdown_path.read_bytes()
+    disk_manifest_bytes = res.manifest_path.read_bytes()
+
+    disk_md_sha256 = hashlib.sha256(disk_md_bytes).hexdigest()
+    disk_manifest_sha256 = hashlib.sha256(disk_manifest_bytes).hexdigest()
+
+    assert disk_md_sha256 == res.markdown_sha256
+    assert disk_manifest_sha256 == res.manifest_sha256
+
+    manifest_dict = json.loads(disk_manifest_bytes.decode("utf-8"))
+    assert manifest_dict["output_sha256"] == disk_md_sha256
