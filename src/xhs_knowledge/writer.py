@@ -1,19 +1,45 @@
 """DigestWriter: Atomic serialization and physical boundary isolation for Phase C.2 MVP.
 
-Writes:
-1. Markdown artifact: Vault/digests/<YYYY-MM-DD>_<digest_name>.md
-2. Manifest artifact: Vault/digests/<YYYY-MM-DD>_<digest_name>.manifest.json
+Publication layout (immutable-generation + atomic-pointer model):
 
-Enforces:
-- Physical boundary containment strictly within Vault/digests/ (symlink escape prevention).
-- Two-phase prepare-and-publish with atomic rollback: failure during publication cannot
-  leave a mismatched valid artifact pair.
-- Unknown file overwrite protection: refuses to overwrite or delete files that lack digest signatures.
-- Stale Markdown cleanup: on zero-valid rerun, removes existing managed Markdown file and publishes
-  only an INCOMPLETE manifest.
-- Verbatim evidence preservation: persists exact un-stripped, un-normalized verbatim_quote in manifest.
-- ValidationResult trust boundary: validates counts and re-verifies structural provenance of all
-  validated excerpts against EvidenceBundle before publishing.
+    Vault/digests/<artifact-key>/
+        generations/
+            <generation-id>/
+                digest.md          # absent for zero-evidence generations
+                manifest.json
+        current.json
+
+Crash-safety design (honest scope): the complete immutable generation is prepared
+and fsynced before publication; a single atomically replaced ``current.json`` file
+acts as the publication commit point. This is NOT a multi-file filesystem
+transaction — atomicity comes from having one pointer file as the commit point,
+not from cross-file atomic replace. Guarantees are those of POSIX rename + fsync:
+
+- Crash/failure before the current.json replacement: the previous current.json
+  remains authoritative and the previous generation remains fully valid; any
+  orphaned staging directory or unreferenced generation is never current.
+- Crash after the current.json replacement: the new generation was already fully
+  prepared, so the pointer references a complete generation.
+- There is never an authoritative state mixing new Markdown with an old manifest
+  (or vice versa): both live inside one immutable generation directory.
+
+Generation identity is deterministic: the generation ID is derived from a SHA256
+over the manifest bytes, which cover only stable inputs (request fingerprint,
+bundle content hash, generated_at, validated excerpt structural contents, counts,
+status/errors). Fixed inputs plus fixed generated_at therefore reproduce the same
+generation ID and byte-identical artifacts. Published generations are immutable
+and never mutated, overwritten, or deleted; no backup/rollback mechanism exists.
+
+Also enforces:
+- Physical boundary containment strictly within Vault/digests/ (symlink escape
+  prevention); current.json is always a regular file, never a symlink.
+- Unknown file protection: refuses to publish over foreign files or directories
+  that lack digest publication signatures.
+- Verbatim evidence preservation: persists exact un-stripped, un-normalized
+  verbatim_quote in manifest.
+- ValidationResult trust boundary: validates status/count/error consistency and
+  re-verifies structural provenance of all validated excerpts against EvidenceBundle
+  before publishing anything.
 - Zero NLP, zero summarization, zero rewriting, zero editorial commentary.
 """
 
@@ -23,6 +49,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,12 +64,25 @@ from xhs_knowledge.contracts import (
 )
 from xhs_knowledge.validator import ProvenanceValidator, ValidationResult
 
+GENERATIONS_DIRNAME = "generations"
+CURRENT_POINTER_FILENAME = "current.json"
+GENERATION_MARKDOWN_FILENAME = "digest.md"
+GENERATION_MANIFEST_FILENAME = "manifest.json"
+POINTER_VERSION = "1.0"
+
+_VALID_STATUSES = ("PASS", "FAILED")
+_VALID_ARTIFACT_STATUSES = ("COMPLETE", "INCOMPLETE")
+
 
 @dataclass
 class DigestWriterResult:
     """Structured result of DigestWriter execution."""
+    artifact_key: str
+    generation_id: str
+    generation_dir: Path
     markdown_path: Path | None
     manifest_path: Path
+    current_pointer_path: Path
     artifact_status: str  # "COMPLETE" | "INCOMPLETE"
     content_mode: str  # "VERIFIED_SOURCE_EXCERPTS"
     markdown_sha256: str
@@ -52,8 +92,12 @@ class DigestWriterResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "artifact_key": self.artifact_key,
+            "generation_id": self.generation_id,
+            "generation_dir": str(self.generation_dir),
             "markdown_path": str(self.markdown_path) if self.markdown_path else None,
             "manifest_path": str(self.manifest_path),
+            "current_pointer_path": str(self.current_pointer_path),
             "artifact_status": self.artifact_status,
             "content_mode": self.content_mode,
             "markdown_sha256": self.markdown_sha256,
@@ -112,44 +156,66 @@ class DigestWriter:
 
         return resolved
 
-    def _is_known_digest_artifact(self, path: Path) -> bool:
-        """Checks whether an existing file has the signature of a previously generated digest artifact."""
-        if not path.is_file():
+    def _is_managed_artifact_dir(self, artifact_dir: Path) -> bool:
+        """Checks whether an existing directory only contains digest-managed entries.
+
+        Managed entries: the pointer file, the generations root, and hidden staging
+        leftovers from interrupted publications. Any other visible entry marks the
+        directory as foreign user data.
+        """
+        managed_names = {CURRENT_POINTER_FILENAME, GENERATIONS_DIRNAME}
+        try:
+            entries = list(artifact_dir.iterdir())
+        except OSError:
+            return False
+        for child in entries:
+            if child.name in managed_names or child.name.startswith("."):
+                continue
+            return False
+        return True
+
+    def _is_known_current_pointer(self, path: Path) -> bool:
+        """Checks whether an existing file has the signature of a published current.json pointer."""
+        if not path.is_file() or path.is_symlink():
             return False
         try:
-            if path.suffix == ".md":
-                with open(path, "r", encoding="utf-8") as f:
-                    header = f.read(1024)
-                return (
-                    header.startswith("---\n")
-                    and 'content_mode: "VERIFIED_SOURCE_EXCERPTS"' in header
-                    and "digest_name:" in header
-                )
-            elif path.suffix == ".json":
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return (
-                    isinstance(data, dict)
-                    and data.get("manifest_version") == "1.0"
-                    and data.get("content_mode") == "VERIFIED_SOURCE_EXCERPTS"
-                )
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return False
-        return False
+        return (
+            isinstance(data, dict)
+            and data.get("pointer_version") == POINTER_VERSION
+            and data.get("content_mode") == "VERIFIED_SOURCE_EXCERPTS"
+            and isinstance(data.get("artifact_key"), str)
+            and bool(data.get("artifact_key"))
+            and isinstance(data.get("generation_id"), str)
+            and bool(data.get("generation_id"))
+            and data.get("artifact_status") in _VALID_ARTIFACT_STATUSES
+            and isinstance(data.get("manifest"), str)
+            and (data.get("markdown") is None or isinstance(data.get("markdown"), str))
+        )
 
     def _assert_validation_trust_boundary(
         self, validation_result: ValidationResult, bundle: EvidenceBundle
     ) -> None:
-        """Enforces trust boundary on ValidationResult before publishing.
+        """Enforces trust boundary on ValidationResult before publishing anything.
 
         Checks:
-        1. Correct type and internal count consistency.
-        2. Status and count invariant: PASS requires validated_count > 0 and failed_count == 0.
+        1. Correct type, known status, and internal count consistency.
+        2. Status invariants:
+           - PASS requires validated_count > 0, failed_count == 0, and errors == [].
+           - FAILED requires errors != [].
         3. Structural provenance re-verification of every validated excerpt against EvidenceBundle.
         """
         if not isinstance(validation_result, ValidationResult):
             raise ValueError(
                 f"validation_result must be a ValidationResult instance, got {type(validation_result).__name__}."
+            )
+
+        if validation_result.status not in _VALID_STATUSES:
+            raise ValueError(
+                f"ValidationResult invalid status: '{validation_result.status}'. "
+                f"Expected one of {_VALID_STATUSES}."
             )
 
         if validation_result.validated_count != len(validation_result.validated_excerpts):
@@ -164,13 +230,22 @@ class DigestWriter:
                 f"!= len(omitted_excerpts) ({len(validation_result.omitted_excerpts)})."
             )
 
-        if validation_result.status == "PASS" and (
-            validation_result.failed_count > 0 or validation_result.validated_count == 0
-        ):
-            raise ValueError(
-                f"ValidationResult invalid status invariant: status is PASS but validated_count="
-                f"{validation_result.validated_count}, failed_count={validation_result.failed_count}."
-            )
+        if validation_result.status == "PASS":
+            if validation_result.validated_count <= 0 or validation_result.failed_count != 0:
+                raise ValueError(
+                    f"ValidationResult invalid status invariant: status is PASS but validated_count="
+                    f"{validation_result.validated_count}, failed_count={validation_result.failed_count}."
+                )
+            if validation_result.errors:
+                raise ValueError(
+                    f"ValidationResult invalid status invariant: status is PASS but errors is non-empty "
+                    f"({len(validation_result.errors)} error(s))."
+                )
+        else:  # FAILED
+            if not validation_result.errors:
+                raise ValueError(
+                    "ValidationResult invalid status invariant: status is FAILED but errors is empty."
+                )
 
         # Structural provenance re-verification against bundle
         validator = ProvenanceValidator()
@@ -184,6 +259,73 @@ class DigestWriter:
                     f"ValidationResult trust boundary violation: excerpt for note '{note_id}' "
                     f"failed structural provenance re-verification ({err_code}: {err_msg})."
                 )
+
+    @staticmethod
+    def _write_file_fsynced(path: Path, data: bytes) -> None:
+        """Writes bytes to a fresh file and fsyncs it so contents survive a crash."""
+        with open(path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        """Best-effort fsync of a directory so rename/create operations are durable."""
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _verify_existing_generation(
+        self,
+        generation_dir: Path,
+        markdown_bytes: bytes | None,
+        manifest_bytes: bytes,
+    ) -> None:
+        """Fails closed unless an existing generation dir exactly matches the expected bytes.
+
+        Deterministic generation IDs can collide with a previously published (or
+        orphaned) generation. Identical content is safely reused; anything else
+        (missing/extra files, byte differences, non-directory, symlink) is rejected
+        without mutating it.
+        """
+        if generation_dir.is_symlink() or not generation_dir.is_dir():
+            raise ValueError(
+                f"Refusing to publish: deterministic generation path '{generation_dir}' "
+                f"already exists and is not a managed generation directory."
+            )
+        expected_names = {GENERATION_MANIFEST_FILENAME}
+        if markdown_bytes is not None:
+            expected_names.add(GENERATION_MARKDOWN_FILENAME)
+        try:
+            actual_names = {child.name for child in generation_dir.iterdir()}
+        except OSError as exc:
+            raise ValueError(
+                f"Refusing to publish: cannot inspect existing generation '{generation_dir}': {exc}."
+            ) from exc
+        if actual_names != expected_names:
+            raise ValueError(
+                f"Refusing to publish: existing generation '{generation_dir}' contains "
+                f"unexpected content (found {sorted(actual_names)}, expected {sorted(expected_names)})."
+            )
+        if (generation_dir / GENERATION_MANIFEST_FILENAME).read_bytes() != manifest_bytes:
+            raise ValueError(
+                f"Refusing to publish: existing generation '{generation_dir}' manifest bytes "
+                f"differ from the deterministic generation content."
+            )
+        if markdown_bytes is not None and (
+            (generation_dir / GENERATION_MARKDOWN_FILENAME).read_bytes() != markdown_bytes
+        ):
+            raise ValueError(
+                f"Refusing to publish: existing generation '{generation_dir}' markdown bytes "
+                f"differ from the deterministic generation content."
+            )
 
     def format_markdown(
         self,
@@ -200,7 +342,6 @@ class DigestWriter:
 
         referenced_notes = [n for n in bundle.notes if n.note_id in excerpts_by_note]
         source_collection = request.source.collections[0]
-        manifest_filename = f"{request.target_date}_{request.digest_name}.manifest.json"
 
         lines = [
             "---",
@@ -248,7 +389,7 @@ class DigestWriter:
             "## 📊 Digest Provenance & Audit",
             f"- **Referenced Notes**: {len(referenced_notes)}",
             "- **Evidence Verification**: 100% verified against local vault artifacts",
-            f"- **Audit Manifest**: `digests/{manifest_filename}`",
+            f"- **Audit Manifest**: `{GENERATION_MANIFEST_FILENAME}`",
             "",
         ])
 
@@ -319,14 +460,26 @@ class DigestWriter:
         """Serializes the digest and manifest according to validated provenance.
 
         Fail-closed guarantees:
-        - ValidationResult trust boundary re-checks all validated excerpts.
-        - Zero validated excerpts: removes any stale same-name Markdown file and publishes
-          only an INCOMPLETE manifest.
-        - Two-phase prepare-and-publish: failures during commit roll back cleanly,
-          preventing mismatched artifact pairs.
-        - Preserves unknown-file protection on both .md and .manifest.json targets.
+        - ValidationResult trust boundary re-checks status/count/error consistency and
+          all validated excerpts BEFORE any filesystem mutation.
+        - All output bytes are built before publication begins (Phase 1: prepare).
+        - Generation files are fully written and fsynced into a temporary directory,
+          which is then atomically renamed to ``generations/<generation-id>/``
+          (Phases 2-3: stage + finalize). Published generations are immutable.
+        - ``current.json`` is the ONLY commit point (Phase 4: commit): a temp pointer
+          file is written, fsynced, and atomically replaced over the published pointer.
+          Failure before that replacement leaves the previous generation authoritative
+          and fully intact; there is no backup/rollback path.
+        - Zero validated excerpts: publishes a manifest-only INCOMPLETE generation
+          (no digest.md) and points current.json at it; older generations remain as
+          immutable history and are never deleted.
+        - Deterministic generation IDs: fixed inputs + fixed generated_at reproduce the
+          same generation; an existing identical generation is verified and reused,
+          never overwritten.
+        - Unknown-file and symlink boundary protections apply to the whole
+          publication tree.
         """
-        # 1. Parameter format & boundary validation
+        # ===== Phase 1 (part): validate all inputs and trust invariants =====
         self._validate_safe_name(request.digest_name, "digest_name")
         self._validate_safe_name(request.target_date, "target_date")
 
@@ -343,229 +496,160 @@ class DigestWriter:
                 f"DigestRequest must contain exactly 1 collection, got {len(request.source.collections)}."
             )
 
-        # 2. Enforce trust boundary on ValidationResult
+        # Enforce trust boundary BEFORE any filesystem mutation
         self._assert_validation_trust_boundary(validation_result, bundle)
 
         if generated_at is None:
             generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        markdown_filename = f"{request.target_date}_{request.digest_name}.md"
-        manifest_filename = f"{request.target_date}_{request.digest_name}.manifest.json"
+        artifact_key = f"{request.target_date}_{request.digest_name}"
+        artifact_dir = self.digests_dir / artifact_key
+        generations_dir = artifact_dir / GENERATIONS_DIRNAME
+        current_pointer_path = artifact_dir / CURRENT_POINTER_FILENAME
 
-        markdown_path = self.digests_dir / markdown_filename
-        manifest_path = self.digests_dir / manifest_filename
+        # Physical boundary containment for the whole publication tree
+        self._require_inside_digests(artifact_dir)
+        self._require_inside_digests(generations_dir)
+        self._require_inside_digests(current_pointer_path)
 
-        self._require_inside_digests(markdown_path)
-        self._require_inside_digests(manifest_path)
         self.digests_dir.mkdir(parents=True, exist_ok=True)
 
-        # =====================================================================
-        # CASE 1: Zero Validated Excerpts (Fail-Closed, Remove Stale Markdown)
-        # =====================================================================
+        # Unknown-file protection: refuse to touch foreign paths before mutating anything
+        if artifact_dir.exists() or artifact_dir.is_symlink():
+            if not artifact_dir.is_dir():
+                raise BoundaryViolationError(
+                    f"Refusing to publish digest artifact: path '{artifact_dir}' exists and is not a directory."
+                )
+            if not self._is_managed_artifact_dir(artifact_dir):
+                raise BoundaryViolationError(
+                    f"Refusing to publish digest artifact: directory '{artifact_dir}' contains "
+                    f"unknown/non-digest files."
+                )
+        if generations_dir.exists() or generations_dir.is_symlink():
+            if not generations_dir.is_dir():
+                raise BoundaryViolationError(
+                    f"Refusing to publish digest artifact: generations path '{generations_dir}' "
+                    f"exists and is not a directory."
+                )
+        if current_pointer_path.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"A digest publication already exists at '{current_pointer_path}' and overwrite=False."
+                )
+            if not self._is_known_current_pointer(current_pointer_path):
+                raise BoundaryViolationError(
+                    f"Refusing to overwrite unknown/non-digest file at '{current_pointer_path}'."
+                )
+
+        # ===== Phase 1: prepare all output bytes and hashes in memory =====
         if validation_result.validated_count == 0:
+            # Zero-evidence generation: manifest only, no digest.md
             artifact_status = "INCOMPLETE"
-
-            # Check unknown file protection before modifying anything
-            if markdown_path.exists():
-                if not overwrite:
-                    raise FileExistsError(f"Target file '{markdown_path.name}' already exists and overwrite=False.")
-                if not self._is_known_digest_artifact(markdown_path):
-                    raise BoundaryViolationError(
-                        f"Refusing to remove unknown/non-digest file at '{markdown_path}'."
-                    )
-            if manifest_path.exists():
-                if not overwrite:
-                    raise FileExistsError(f"Target file '{manifest_path.name}' already exists and overwrite=False.")
-                if not self._is_known_digest_artifact(manifest_path):
-                    raise BoundaryViolationError(
-                        f"Refusing to overwrite unknown/non-digest file at '{manifest_path}'."
-                    )
-
-            manifest_data = self.format_manifest(
+            markdown_bytes: bytes | None = None
+            markdown_sha256 = ""
+            markdown_rel_path = ""
+        else:
+            artifact_status = "COMPLETE" if validation_result.is_valid else "INCOMPLETE"
+            markdown_content = self.format_markdown(
                 request=request,
                 bundle=bundle,
                 validation_result=validation_result,
-                markdown_rel_path="",
-                markdown_sha256="",
                 generated_at=generated_at,
                 artifact_status=artifact_status,
             )
-            manifest_json = json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-            manifest_bytes = manifest_json.encode("utf-8")
-            manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-
-            # Staging temp file for manifest
-            tmp_manifest = self.digests_dir / f".tmp_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}"
-            backup_md = self.digests_dir / f".bak_{markdown_filename}_{os.getpid()}_{uuid.uuid4().hex}" if markdown_path.exists() else None
-            backup_manifest = self.digests_dir / f".bak_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}" if manifest_path.exists() else None
-
-            try:
-                with open(tmp_manifest, "wb") as f:
-                    f.write(manifest_bytes)
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                # Transactional commit: move existing files to backup
-                if backup_md:
-                    os.replace(markdown_path, backup_md)
-                if backup_manifest:
-                    os.replace(manifest_path, backup_manifest)
-
-                # Publish manifest
-                os.replace(tmp_manifest, manifest_path)
-
-                # Clean up backups (stale markdown is safely removed!)
-                if backup_md and backup_md.exists():
-                    backup_md.unlink()
-                if backup_manifest and backup_manifest.exists():
-                    backup_manifest.unlink()
-
-            except Exception:
-                # Rollback on failure
-                if backup_md and backup_md.exists():
-                    os.replace(backup_md, markdown_path)
-                if backup_manifest and backup_manifest.exists():
-                    os.replace(backup_manifest, manifest_path)
-                raise
-            finally:
-                if tmp_manifest.exists():
-                    try:
-                        tmp_manifest.unlink()
-                    except OSError:
-                        pass
-                if backup_md and backup_md.exists():
-                    try:
-                        backup_md.unlink()
-                    except OSError:
-                        pass
-                if backup_manifest and backup_manifest.exists():
-                    try:
-                        backup_manifest.unlink()
-                    except OSError:
-                        pass
-
-            return DigestWriterResult(
-                markdown_path=None,
-                manifest_path=manifest_path,
-                artifact_status=artifact_status,
-                content_mode="VERIFIED_SOURCE_EXCERPTS",
-                markdown_sha256="",
-                manifest_sha256=manifest_sha256,
-                verified_excerpts_count=0,
-                omitted_excerpts_count=validation_result.failed_count,
-            )
-
-        # =====================================================================
-        # CASE 2: Validated Excerpts > 0 (Two-Phase Prepare-and-Publish)
-        # =====================================================================
-        artifact_status = "COMPLETE" if validation_result.is_valid else "INCOMPLETE"
-
-        # Check unknown file protection before preparing or modifying
-        for target in (markdown_path, manifest_path):
-            if target.exists():
-                if not overwrite:
-                    raise FileExistsError(f"Target file '{target.name}' already exists and overwrite=False.")
-                if not self._is_known_digest_artifact(target):
-                    raise BoundaryViolationError(
-                        f"Refusing to overwrite unknown/non-digest file at '{target}'."
-                    )
-
-        # Phase 1: Prepare contents & checksums
-        markdown_content = self.format_markdown(
-            request=request,
-            bundle=bundle,
-            validation_result=validation_result,
-            generated_at=generated_at,
-            artifact_status=artifact_status,
-        )
-        markdown_bytes = markdown_content.encode("utf-8")
-        markdown_sha256 = hashlib.sha256(markdown_bytes).hexdigest()
+            markdown_bytes = markdown_content.encode("utf-8")
+            markdown_sha256 = hashlib.sha256(markdown_bytes).hexdigest()
+            markdown_rel_path = GENERATION_MARKDOWN_FILENAME
 
         manifest_data = self.format_manifest(
             request=request,
             bundle=bundle,
             validation_result=validation_result,
-            markdown_rel_path=f"digests/{markdown_filename}",
+            markdown_rel_path=markdown_rel_path,
             markdown_sha256=markdown_sha256,
             generated_at=generated_at,
             artifact_status=artifact_status,
         )
-        manifest_json = json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        manifest_bytes = manifest_json.encode("utf-8")
+        manifest_bytes = (
+            json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
 
-        # Write both to temp staging files
-        tmp_md = self.digests_dir / f".tmp_{markdown_filename}_{os.getpid()}_{uuid.uuid4().hex}"
-        tmp_manifest = self.digests_dir / f".tmp_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}"
-        backup_md = self.digests_dir / f".bak_{markdown_filename}_{os.getpid()}_{uuid.uuid4().hex}" if markdown_path.exists() else None
-        backup_manifest = self.digests_dir / f".bak_{manifest_filename}_{os.getpid()}_{uuid.uuid4().hex}" if manifest_path.exists() else None
+        # Deterministic generation identity: SHA256 over the manifest bytes, which cover
+        # request fingerprint, bundle content hash, generated_at, excerpt structural
+        # contents, counts, and status/errors. No filesystem state, no circular hashing.
+        generation_id = f"gen_{hashlib.sha256(manifest_bytes).hexdigest()}"
+        final_generation_dir = generations_dir / generation_id
 
-        md_committed = False
-        manifest_committed = False
+        pointer_data = {
+            "pointer_version": POINTER_VERSION,
+            "artifact_key": artifact_key,
+            "generation_id": generation_id,
+            "artifact_status": artifact_status,
+            "content_mode": "VERIFIED_SOURCE_EXCERPTS",
+            "manifest": f"{GENERATIONS_DIRNAME}/{generation_id}/{GENERATION_MANIFEST_FILENAME}",
+            "markdown": (
+                f"{GENERATIONS_DIRNAME}/{generation_id}/{GENERATION_MARKDOWN_FILENAME}"
+                if markdown_bytes is not None
+                else None
+            ),
+        }
+        pointer_bytes = (
+            json.dumps(pointer_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
 
+        # ===== Phases 2-3: stage the generation, then finalize by atomic rename =====
+        generations_dir.mkdir(parents=True, exist_ok=True)
+        tmp_pointer_path: Path | None = None
+        if final_generation_dir.exists():
+            # Same deterministic generation already published (or orphaned by a crash
+            # after finalize): verify byte-identical content and reuse it immutably.
+            self._verify_existing_generation(final_generation_dir, markdown_bytes, manifest_bytes)
+        else:
+            staging_dir = artifact_dir / f".staging_{os.getpid()}_{uuid.uuid4().hex}"
+            try:
+                staging_dir.mkdir()
+                if markdown_bytes is not None:
+                    self._write_file_fsynced(staging_dir / GENERATION_MARKDOWN_FILENAME, markdown_bytes)
+                self._write_file_fsynced(staging_dir / GENERATION_MANIFEST_FILENAME, manifest_bytes)
+                self._fsync_dir(staging_dir)
+
+                os.rename(staging_dir, final_generation_dir)
+                self._fsync_dir(generations_dir)
+                self._fsync_dir(artifact_dir)
+            except BaseException:
+                # Best-effort cleanup of OUR unpublished staging directory only.
+                # Published generations and the current pointer are never touched.
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                raise
+
+        # ===== Phase 4: commit — atomically replace current.json (ONLY commit point) =====
         try:
-            with open(tmp_md, "wb") as f_md:
-                f_md.write(markdown_bytes)
-                f_md.flush()
-                os.fsync(f_md.fileno())
-
-            with open(tmp_manifest, "wb") as f_mf:
-                f_mf.write(manifest_bytes)
-                f_mf.flush()
-                os.fsync(f_mf.fileno())
-
-            # Phase 2: Atomic Publication with Rollback
-            # Backup existing
-            if backup_md:
-                os.replace(markdown_path, backup_md)
-            if backup_manifest:
-                os.replace(manifest_path, backup_manifest)
-
-            # Publish markdown
-            os.replace(tmp_md, markdown_path)
-            md_committed = True
-
-            # Publish manifest
-            os.replace(tmp_manifest, manifest_path)
-            manifest_committed = True
-
-            # Publication complete: remove backups
-            if backup_md and backup_md.exists():
-                backup_md.unlink()
-            if backup_manifest and backup_manifest.exists():
-                backup_manifest.unlink()
-
-        except Exception:
-            # Transaction Rollback: restore previous state or remove orphaned published file
-            if md_committed:
-                if backup_md and backup_md.exists():
-                    os.replace(backup_md, markdown_path)
-                elif markdown_path.exists():
-                    markdown_path.unlink()
-            elif backup_md and backup_md.exists():
-                os.replace(backup_md, markdown_path)
-
-            if manifest_committed:
-                if backup_manifest and backup_manifest.exists():
-                    os.replace(backup_manifest, manifest_path)
-                elif manifest_path.exists():
-                    manifest_path.unlink()
-            elif backup_manifest and backup_manifest.exists():
-                os.replace(backup_manifest, manifest_path)
-
+            tmp_pointer_path = artifact_dir / f".{CURRENT_POINTER_FILENAME}.{uuid.uuid4().hex}.tmp"
+            self._write_file_fsynced(tmp_pointer_path, pointer_bytes)
+            os.replace(tmp_pointer_path, current_pointer_path)
+            tmp_pointer_path = None
+            self._fsync_dir(artifact_dir)
+        except BaseException:
+            # The previous pointer (if any) remains authoritative; never touch generations.
+            if tmp_pointer_path is not None:
+                try:
+                    tmp_pointer_path.unlink()
+                except OSError:
+                    pass
             raise
-        finally:
-            # Clean up temp and backup files
-            for p in (tmp_md, tmp_manifest, backup_md, backup_manifest):
-                if p and p.exists():
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
 
         return DigestWriterResult(
-            markdown_path=markdown_path,
-            manifest_path=manifest_path,
+            artifact_key=artifact_key,
+            generation_id=generation_id,
+            generation_dir=final_generation_dir,
+            markdown_path=(
+                final_generation_dir / GENERATION_MARKDOWN_FILENAME
+                if markdown_bytes is not None
+                else None
+            ),
+            manifest_path=final_generation_dir / GENERATION_MANIFEST_FILENAME,
+            current_pointer_path=current_pointer_path,
             artifact_status=artifact_status,
             content_mode="VERIFIED_SOURCE_EXCERPTS",
             markdown_sha256=markdown_sha256,
