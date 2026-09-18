@@ -292,8 +292,8 @@ class DigestWriter:
 
         Deterministic generation IDs can collide with a previously published (or
         orphaned) generation. Identical content is safely reused; anything else
-        (missing/extra files, byte differences, non-directory, symlink) is rejected
-        without mutating it.
+        (missing/extra files, byte differences, non-directory, symlinked directory,
+        or symlinked/irregular generation members) is rejected without mutating it.
         """
         if generation_dir.is_symlink() or not generation_dir.is_dir():
             raise ValueError(
@@ -314,18 +314,32 @@ class DigestWriter:
                 f"Refusing to publish: existing generation '{generation_dir}' contains "
                 f"unexpected content (found {sorted(actual_names)}, expected {sorted(expected_names)})."
             )
-        if (generation_dir / GENERATION_MANIFEST_FILENAME).read_bytes() != manifest_bytes:
+        # Members must be regular non-symlink files inside the generation directory;
+        # a symlink child resolving to byte-identical content outside the Vault is
+        # still a physical boundary violation and must never be made current.
+        manifest_path = generation_dir / GENERATION_MANIFEST_FILENAME
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise BoundaryViolationError(
+                f"Symlink boundary violation: generation member '{manifest_path}' is not a "
+                f"regular non-symlink file."
+            )
+        if manifest_path.read_bytes() != manifest_bytes:
             raise ValueError(
                 f"Refusing to publish: existing generation '{generation_dir}' manifest bytes "
                 f"differ from the deterministic generation content."
             )
-        if markdown_bytes is not None and (
-            (generation_dir / GENERATION_MARKDOWN_FILENAME).read_bytes() != markdown_bytes
-        ):
-            raise ValueError(
-                f"Refusing to publish: existing generation '{generation_dir}' markdown bytes "
-                f"differ from the deterministic generation content."
-            )
+        if markdown_bytes is not None:
+            markdown_path = generation_dir / GENERATION_MARKDOWN_FILENAME
+            if markdown_path.is_symlink() or not markdown_path.is_file():
+                raise BoundaryViolationError(
+                    f"Symlink boundary violation: generation member '{markdown_path}' is not a "
+                    f"regular non-symlink file."
+                )
+            if markdown_path.read_bytes() != markdown_bytes:
+                raise ValueError(
+                    f"Refusing to publish: existing generation '{generation_dir}' markdown bytes "
+                    f"differ from the deterministic generation content."
+                )
 
     def format_markdown(
         self,

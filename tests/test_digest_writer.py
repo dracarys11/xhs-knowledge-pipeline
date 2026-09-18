@@ -926,3 +926,69 @@ def test_conflicting_existing_generation_content_fails_closed(
     # Tampered content is left as-is (writer never mutates it); nothing else published.
     assert gen_manifest.read_bytes() != original
     assert hidden_leftovers(artifact_dir_of(tmp_path)) == []
+
+
+# =============================================================================
+# P0 regression: symlinked generation members must block deterministic reuse
+# =============================================================================
+
+
+def _assert_reuse_rejects_symlinked_member(
+    tmp_path: Path,
+    sample_request: DigestRequest,
+    sample_bundle: EvidenceBundle,
+    member_filename: str,
+) -> None:
+    """Shared regression body: byte-identical symlink member must never be reused.
+
+    Replaces one member of an existing deterministic generation with a symlink to
+    an OUTSIDE file holding the exact expected bytes, then reruns the identical
+    write. The deterministic generation ID collides, forcing the reuse path.
+    """
+    writer = DigestWriter(vault_dir=tmp_path)
+
+    res1 = writer.write(sample_request, sample_bundle, pass_result(), generated_at=FIXED_TIME)
+    pointer_before = (artifact_dir_of(tmp_path) / CURRENT_POINTER_FILENAME).read_bytes()
+
+    member = res1.generation_dir / member_filename
+    expected_bytes = member.read_bytes()
+
+    # Outside-the-vault file with byte-identical content.
+    outside_file = tmp_path.parent / f"outside_symlink_member_{member_filename}"
+    outside_file.write_bytes(expected_bytes)
+    member.unlink()
+    member.symlink_to(outside_file)
+
+    # Precondition: the trap is armed — member is a symlink yet reads back identical bytes.
+    assert member.is_symlink()
+    assert member.read_bytes() == expected_bytes
+
+    # Identical inputs + identical generated_at -> same deterministic generation ID -> reuse path.
+    with pytest.raises(BoundaryViolationError, match="(?i)symlink"):
+        writer.write(sample_request, sample_bundle, pass_result(), generated_at=FIXED_TIME)
+
+    # Rejection happened before the commit point: current.json must be untouched.
+    pointer_after = (artifact_dir_of(tmp_path) / CURRENT_POINTER_FILENAME).read_bytes()
+    assert pointer_after == pointer_before
+    assert json.loads(pointer_after)["generation_id"] == res1.generation_id
+
+    # Nothing staged, nothing published, nothing cleaned up.
+    assert hidden_leftovers(artifact_dir_of(tmp_path)) == []
+
+
+def test_reuse_rejects_symlinked_manifest_member(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+):
+    """P0: manifest.json symlinked to an outside byte-identical file blocks reuse."""
+    _assert_reuse_rejects_symlinked_member(
+        tmp_path, sample_request, sample_bundle, GENERATION_MANIFEST_FILENAME
+    )
+
+
+def test_reuse_rejects_symlinked_markdown_member(
+    tmp_path: Path, sample_request: DigestRequest, sample_bundle: EvidenceBundle
+):
+    """P0: digest.md symlinked to an outside byte-identical file blocks reuse."""
+    _assert_reuse_rejects_symlinked_member(
+        tmp_path, sample_request, sample_bundle, GENERATION_MARKDOWN_FILENAME
+    )
